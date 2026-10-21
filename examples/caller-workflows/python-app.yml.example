@@ -1,0 +1,30 @@
+# Example only. Copy and adjust in an application repository.
+# Use the central repository's main branch while the first release is pending.
+# Adopt an approved release tag or full commit SHA when one is available.
+name: Application CI
+
+on:
+  pull_request:
+  push:
+    branches: [main] # Replace with the caller repository's actual default branch.
+
+permissions:
+  contents: read
+
+jobs:
+  application-ci:
+    name: Application CI
+    permissions:
+      actions: read
+      contents: read
+    uses: Lekanlekzy/stage1-devsecops/.github/workflows/reusable-app-ci.yml@main
+    with:
+      language: python
+      working_directory: .
+      python_version: '3.12'
+      sonar_organization: ${{ vars.SONAR_ORGANIZATION }}
+      sonar_project_key: ${{ vars.SONAR_PROJECT_KEY }}
+      run_container_checks: false
+      publish_image: false
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

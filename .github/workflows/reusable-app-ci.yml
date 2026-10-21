@@ -1,0 +1,701 @@
+name: Central reusable application CI
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: 'Fixed language profile: java-maven, java-gradle, python, node, dotnet, or go.'
+        required: true
+        type: string
+      working_directory:
+        description: Application project directory, relative to the repository root.
+        required: false
+        type: string
+        default: .
+      java_version:
+        description: Java version for both Java profiles.
+        required: false
+        type: string
+        default: '21'
+      python_version:
+        description: Python version for the Python profile.
+        required: false
+        type: string
+        default: '3.12'
+      node_version:
+        description: Node.js version for the Node profile.
+        required: false
+        type: string
+        default: '24'
+      node_typescript:
+        description: Require the typecheck npm script for the Node profile.
+        required: false
+        type: boolean
+        default: true
+      dotnet_version:
+        description: .NET SDK version for the .NET profile.
+        required: false
+        type: string
+        default: 10.0.x
+      dotnet_project:
+        description: Optional solution or project path relative to working_directory. Required when detection is ambiguous.
+        required: false
+        type: string
+        default: ''
+      go_version:
+        description: Go version for the Go profile.
+        required: false
+        type: string
+        default: 1.27.x
+      sonar_organization:
+        description: Existing SonarQube Cloud organization key.
+        required: true
+        type: string
+      sonar_project_key:
+        description: Non-secret key of the existing SonarQube Cloud project that receives this application's analysis.
+        required: true
+        type: string
+      run_container_checks:
+        description: Build and scan the Dockerfile in container_context.
+        required: false
+        type: boolean
+        default: false
+      container_context:
+        description: Docker build context, relative to the repository root.
+        required: false
+        type: string
+        default: .
+      publish_image:
+        description: Publish the scanned image to GHCR from a push to the caller's actual default branch.
+        required: false
+        type: boolean
+        default: false
+      image_name:
+        description: Optional lowercase GHCR image name (ghcr.io/owner/name); defaults to ghcr.io/caller-repository.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      SONAR_TOKEN:
+        description: SonarQube Cloud analysis token, scoped to this project.
+        required: true
+    outputs:
+      image_uri:
+        description: Published image reference, empty when publication is disabled.
+        value: ${{ jobs.publish.outputs.image_uri }}
+      image_digest:
+        description: Published image manifest digest, empty when publication is disabled.
+        value: ${{ jobs.publish.outputs.image_digest }}
+
+permissions:
+  contents: read
+
+
+jobs:
+  validate:
+    name: Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out caller repository without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate profile and caller configuration
+        id: validate-inputs
+        shell: bash
+        env:
+          APP_WORKING_DIRECTORY: ${{ inputs.working_directory }}
+          LANGUAGE: ${{ inputs.language }}
+          NODE_TYPESCRIPT: ${{ inputs.node_typescript }}
+          DOTNET_PROJECT: ${{ inputs.dotnet_project }}
+          SONAR_ORGANIZATION: ${{ inputs.sonar_organization }}
+          SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key }}
+          RUN_CONTAINER_CHECKS: ${{ inputs.run_container_checks }}
+          PUBLISH_IMAGE: ${{ inputs.publish_image }}
+          CONTAINER_CONTEXT: ${{ inputs.container_context }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_REPOSITORY: ${{ github.event.repository.full_name }}
+          REPOSITORY_IS_FORK: ${{ github.event.repository.fork }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          case "$LANGUAGE" in
+            java-maven|java-gradle|python|node|dotnet|go) ;;
+            *) fail "Unsupported language profile '$LANGUAGE'. Choose java-maven, java-gradle, python, node, dotnet, or go." ;;
+          esac
+
+          python3 - "$GITHUB_WORKSPACE" "$APP_WORKING_DIRECTORY" <<'PY'
+          import os
+          import sys
+
+          root = os.path.realpath(sys.argv[1])
+          relative = sys.argv[2]
+          candidate = os.path.realpath(os.path.join(root, relative))
+          if os.path.commonpath((root, candidate)) != root or not os.path.isdir(candidate):
+              raise SystemExit("::error::working_directory must resolve to an existing directory inside the caller repository.")
+          PY
+          APP_DIR="$(realpath "$GITHUB_WORKSPACE/$APP_WORKING_DIRECTORY")"
+
+          case "$LANGUAGE" in
+            java-maven)
+              test -f "$APP_DIR/pom.xml" || fail "java-maven requires pom.xml in working_directory."
+              ;;
+            java-gradle)
+              test -f "$APP_DIR/gradlew" || fail "java-gradle requires the Gradle wrapper (gradlew)."
+              test -f "$APP_DIR/build.gradle" || test -f "$APP_DIR/build.gradle.kts" || fail "java-gradle requires build.gradle or build.gradle.kts."
+              ;;
+            python)
+              test -f "$APP_DIR/pyproject.toml" || fail "python requires pyproject.toml and a pip-installable [dev] extra."
+              ;;
+            node)
+              test -f "$APP_DIR/package.json" || fail "node requires package.json."
+              test -f "$APP_DIR/package-lock.json" || fail "node requires package-lock.json for deterministic npm ci installs."
+              NODE_TYPESCRIPT="$NODE_TYPESCRIPT" node - "$APP_DIR/package.json" <<'NODE'
+          const fs = require('node:fs');
+          const project = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+          const scripts = project.scripts || {};
+          const required = ['lint', 'format:check', 'test:ci'];
+          if (process.env.NODE_TYPESCRIPT === 'true') required.push('typecheck');
+          const missing = required.filter((name) => !scripts[name]);
+          if (missing.length) {
+            console.error(`::error::node requires npm scripts: ${missing.join(', ')}.`);
+            process.exit(1);
+          }
+          NODE
+              ;;
+            dotnet)
+              if [[ -n "$DOTNET_PROJECT" ]]; then
+                python3 - "$APP_DIR" "$DOTNET_PROJECT" <<'PY'
+          import os
+          import sys
+
+          root = os.path.realpath(sys.argv[1])
+          candidate = os.path.realpath(os.path.join(root, sys.argv[2]))
+          if os.path.commonpath((root, candidate)) != root or not os.path.isfile(candidate):
+              raise SystemExit("::error::dotnet_project must resolve to a solution or project file inside working_directory.")
+          PY
+              else
+                mapfile -t projects < <(find "$APP_DIR" -maxdepth 3 -type f \( -name '*.sln' -o -name '*.slnx' -o -name '*.csproj' \) -print | sort)
+                if [[ "${#projects[@]}" -ne 1 ]]; then
+                  fail "dotnet must contain exactly one discoverable .sln, .slnx, or .csproj, or set dotnet_project explicitly."
+                fi
+              fi
+              ;;
+            go)
+              test -f "$APP_DIR/go.mod" || fail "go requires go.mod in working_directory."
+              ;;
+          esac
+
+          [[ "$SONAR_ORGANIZATION" =~ ^[A-Za-z0-9_-]+$ ]] || fail "sonar_organization contains unsupported characters."
+          [[ "$SONAR_PROJECT_KEY" =~ ^[A-Za-z0-9_.:-]+$ ]] || fail "sonar_project_key contains unsupported characters."
+          python3 - "$APP_DIR" "sonar-project.properties" <<'PY'
+          import os
+          import sys
+
+          root = os.path.realpath(sys.argv[1])
+          config = os.path.realpath(os.path.join(root, sys.argv[2]))
+          if os.path.commonpath((root, config)) != root or not os.path.isfile(config):
+              raise SystemExit("::error::sonar-project.properties must be an existing file inside working_directory.")
+          PY
+
+          if [[ "$RUN_CONTAINER_CHECKS" == true || "$PUBLISH_IMAGE" == true ]]; then
+            python3 - "$GITHUB_WORKSPACE" "$CONTAINER_CONTEXT" <<'PY'
+          import os
+          import sys
+
+          root = os.path.realpath(sys.argv[1])
+          context = os.path.realpath(os.path.join(root, sys.argv[2]))
+          if os.path.commonpath((root, context)) != root or not os.path.isdir(context):
+              raise SystemExit("::error::container_context must resolve to an existing directory inside the caller repository.")
+          if not os.path.isfile(os.path.join(context, "Dockerfile")):
+              raise SystemExit("::error::container checks require Dockerfile in container_context.")
+          PY
+          fi
+
+          if [[ "$PUBLISH_IMAGE" == true ]]; then
+            [[ "$RUN_CONTAINER_CHECKS" == true ]] || fail "publish_image requires run_container_checks=true."
+            [[ "$EVENT_NAME" == push ]] || fail "Image publication is allowed only for push events on the default branch."
+            [[ -n "$DEFAULT_BRANCH" && "$REF_NAME" == "refs/heads/$DEFAULT_BRANCH" ]] || fail "Image publication is allowed only from the caller repository's actual default branch."
+            [[ "$REPOSITORY" == "$EVENT_REPOSITORY" ]] || fail "Image publication is not allowed from forked repositories."
+            [[ "$REPOSITORY_IS_FORK" != true ]] || fail "Image publication is disabled in fork repositories."
+            if [[ -n "$IMAGE_NAME" ]]; then
+              [[ "$IMAGE_NAME" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$ ]] || fail "image_name must be a lowercase ghcr.io/owner/name reference."
+              image_owner="${IMAGE_NAME#ghcr.io/}"
+              image_owner="${image_owner%%/*}"
+              repository_owner="${REPOSITORY%%/*}"
+              repository_owner="${repository_owner,,}"
+              [[ "$image_owner" == "$repository_owner" ]] || fail "image_name must stay in the caller repository owner's GHCR namespace."
+            fi
+          fi
+
+  build-and-test:
+    name: Build and test
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      sonar_java_binaries: ${{ steps.build-paths.outputs.sonar_java_binaries }}
+    steps:
+      - name: Check out caller repository without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve profile build paths
+        id: build-paths
+        working-directory: ${{ inputs.working_directory }}
+        shell: bash
+        env:
+          LANGUAGE: ${{ inputs.language }}
+          DOTNET_PROJECT: ${{ inputs.dotnet_project }}
+        run: |
+          set -euo pipefail
+          case "$LANGUAGE" in
+            java-maven)
+              echo 'sonar_java_binaries=target/classes' >> "$GITHUB_OUTPUT"
+              ;;
+            java-gradle)
+              echo 'sonar_java_binaries=build/classes' >> "$GITHUB_OUTPUT"
+              ;;
+            dotnet)
+              if [[ -n "$DOTNET_PROJECT" ]]; then
+                resolved_dotnet_project="$DOTNET_PROJECT"
+              else
+                mapfile -t projects < <(find . -maxdepth 3 -type f \( -name '*.sln' -o -name '*.slnx' -o -name '*.csproj' \) -print | sort)
+                [[ "${#projects[@]}" -eq 1 ]] || { echo '::error::Expected exactly one .NET solution or project.'; exit 1; }
+                resolved_dotnet_project="${projects[0]#./}"
+              fi
+              [[ "$resolved_dotnet_project" != *$'\n'* && "$resolved_dotnet_project" != *$'\r'* ]] || { echo '::error::.NET project path must be a single line.'; exit 1; }
+              echo "dotnet_project=$resolved_dotnet_project" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+      - name: Set up Java
+        if: ${{ inputs.language == 'java-maven' || inputs.language == 'java-gradle' }}
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+      - name: Set up Python
+        if: ${{ inputs.language == 'python' }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python_version }}
+      - name: Set up Node.js
+        if: ${{ inputs.language == 'node' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ format('{0}/package-lock.json', inputs.working_directory) }}
+      - name: Set up .NET
+        if: ${{ inputs.language == 'dotnet' }}
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ inputs.dotnet_version }}
+      - name: Set up Go
+        if: ${{ inputs.language == 'go' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache-dependency-path: ${{ format('{0}/go.mod', inputs.working_directory) }}
+      - name: Run Maven formatting, lint, and unit tests
+        if: ${{ inputs.language == 'java-maven' }}
+        working-directory: ${{ inputs.working_directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f ./mvnw ]]; then
+            chmod +x ./mvnw
+            ./mvnw --batch-mode --no-transfer-progress spotless:check checkstyle:check verify
+          else
+            mvn --batch-mode --no-transfer-progress spotless:check checkstyle:check verify
+          fi
+      - name: Run Gradle checks and unit tests
+        if: ${{ inputs.language == 'java-gradle' }}
+        working-directory: ${{ inputs.working_directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon check
+      - name: Run Python lint, format, and unit tests
+        if: ${{ inputs.language == 'python' }}
+        working-directory: ${{ inputs.working_directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+          python -m ruff check .
+          python -m ruff format --check .
+          python -m pytest
+      - name: Run Node.js lint, format, typecheck, and unit tests
+        if: ${{ inputs.language == 'node' }}
+        working-directory: ${{ inputs.working_directory }}
+        shell: bash
+        env:
+          NODE_TYPESCRIPT: ${{ inputs.node_typescript }}
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run lint
+          npm run format:check
+          if [[ "$NODE_TYPESCRIPT" == true ]]; then npm run typecheck; fi
+          npm run test:ci
+      - name: Run .NET format validation and unit tests
+        if: ${{ inputs.language == 'dotnet' }}
+        working-directory: ${{ inputs.working_directory }}
+        shell: bash
+        env:
+          DOTNET_PROJECT: ${{ steps.build-paths.outputs.dotnet_project }}
+        run: |
+          set -euo pipefail
+          dotnet restore "$DOTNET_PROJECT"
+          dotnet format "$DOTNET_PROJECT" --verify-no-changes --no-restore
+          dotnet test "$DOTNET_PROJECT" --configuration Release --no-restore
+      - name: Run Go format, vet, and unit tests
+        if: ${{ inputs.language == 'go' }}
+        working-directory: ${{ inputs.working_directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted="$(find . -type f -name '*.go' -print0 | xargs -0 -r gofmt -l)"
+          if [[ -n "$unformatted" ]]; then
+            printf '%s\n' "$unformatted"
+            echo '::error::gofmt found files that are not formatted.'
+            exit 1
+          fi
+          go vet ./...
+          go test ./...
+      - name: Verify Java analysis output exists
+        if: ${{ inputs.language == 'java-maven' || inputs.language == 'java-gradle' }}
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          SONAR_JAVA_BINARIES: ${{ steps.build-paths.outputs.sonar_java_binaries }}
+        shell: bash
+        run: test -d "$SONAR_JAVA_BINARIES"
+      - name: Package Java bytecode for isolated Sonar analysis
+        if: ${{ inputs.language == 'java-maven' || inputs.language == 'java-gradle' }}
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          SONAR_JAVA_BINARIES: ${{ steps.build-paths.outputs.sonar_java_binaries }}
+        shell: bash
+        run: tar -czf "$RUNNER_TEMP/sonar-java-classes.tar.gz" "$SONAR_JAVA_BINARIES"
+      - name: Upload Java bytecode for Sonar analysis
+        if: ${{ inputs.language == 'java-maven' || inputs.language == 'java-gradle' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sonar-java-classes-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sonar-java-classes.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  secret-scan:
+    name: Secret scan
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out caller history without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan full Git history with centrally fixed Gitleaks defaults
+        shell: bash
+        run: |
+          set -euo pipefail
+          config="$RUNNER_TEMP/central-gitleaks.toml"
+          printf 'title = "Central Gitleaks baseline"\n\n[extend]\nuseDefault = true\n' > "$config"
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/repo:ro" \
+            --volume "$config:/central-gitleaks.toml:ro" \
+            ghcr.io/gitleaks/gitleaks:v8.30.0@sha256:691af3c7c5a48b16f187ce3446d5f194838f91238f27270ed36eef6359a574d9 \
+            git --source=/repo --config=/central-gitleaks.toml --redact=100
+
+  dependency-scan:
+    name: Dependency vulnerabilities
+    needs: validate
+    permissions:
+      actions: read
+      contents: read
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@c7c7bcb0773cc4678a674ada03a66cc5c4325476 # v2.6.0
+    with:
+      scan-args: |-
+        --recursive
+        ./
+      upload-sarif: false
+      fail-on-vuln: true
+
+  sonar:
+    name: SonarQube Cloud quality gate
+    needs: [validate, build-and-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out caller source without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Java for Java analysis
+        if: ${{ inputs.language == 'java-maven' || inputs.language == 'java-gradle' }}
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+      - name: Download isolated Java analysis bytecode
+        if: ${{ inputs.language == 'java-maven' || inputs.language == 'java-gradle' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sonar-java-classes-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sonar-java
+      - name: Safely extract Java analysis bytecode
+        if: ${{ inputs.language == 'java-maven' || inputs.language == 'java-gradle' }}
+        env:
+          APP_WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/sonar-java/sonar-java-classes.tar.gz" "$GITHUB_WORKSPACE/$APP_WORKING_DIRECTORY" <<'PY'
+          import os
+          import pathlib
+          import sys
+          import tarfile
+
+          archive_path, destination = sys.argv[1:]
+          root = pathlib.Path(destination).resolve()
+          with tarfile.open(archive_path, "r:gz") as archive:
+              members = archive.getmembers()
+              if len(members) > 100_000 or sum(member.size for member in members) > 2_000_000_000:
+                  raise SystemExit("::error::Java analysis artifact exceeds the safe extraction limit.")
+              for member in members:
+                  relative = pathlib.PurePosixPath(member.name)
+                  if relative.is_absolute() or ".." in relative.parts or not (member.isdir() or member.isfile()):
+                      raise SystemExit("::error::Java analysis artifact contains an unsafe archive entry.")
+                  target = (root / pathlib.Path(*relative.parts)).resolve()
+                  if os.path.commonpath((str(root), str(target))) != str(root):
+                      raise SystemExit("::error::Java analysis artifact escapes working_directory.")
+              archive.extractall(root, members=members, filter="data")
+          PY
+      - name: Analyze source and wait for the SonarQube Cloud quality gate
+        uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: ${{ inputs.working_directory }}
+          args: >-
+            -Dsonar.host.url=https://sonarcloud.io
+            -Dsonar.organization=${{ inputs.sonar_organization }}
+            -Dsonar.projectKey=${{ inputs.sonar_project_key }}
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+            ${{ needs.build-and-test.outputs.sonar_java_binaries != '' && format('-Dsonar.java.binaries={0}', needs.build-and-test.outputs.sonar_java_binaries) || '' }}
+
+  container:
+    name: Container build and scan
+    if: ${{ inputs.run_container_checks || inputs.publish_image }}
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    outputs:
+      image_id: ${{ steps.image.outputs.image_id }}
+      archive_sha256: ${{ steps.image.outputs.archive_sha256 }}
+    steps:
+      - name: Check out caller repository without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build local image without registry credentials
+        id: image
+        shell: bash
+        env:
+          CONTAINER_CONTEXT: ${{ inputs.container_context }}
+          LOCAL_IMAGE: stage1-validation:${{ github.sha }}
+          IMAGE_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          IMAGE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          IMAGE_TITLE: ${{ github.repository }}
+          IMAGE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          created_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          docker build --pull --progress=plain \
+            --label "org.opencontainers.image.source=$IMAGE_SOURCE" \
+            --label "org.opencontainers.image.url=$IMAGE_URL" \
+            --label "org.opencontainers.image.title=$IMAGE_TITLE" \
+            --label "org.opencontainers.image.revision=$IMAGE_REVISION" \
+            --label "org.opencontainers.image.created=$created_at" \
+            --tag "$LOCAL_IMAGE" "$CONTAINER_CONTEXT"
+          docker image save --output "$RUNNER_TEMP/scanned-image.tar" "$LOCAL_IMAGE"
+          image_id="$(docker image inspect --format='{{.Id}}' "$LOCAL_IMAGE")"
+          archive_sha256="$(sha256sum "$RUNNER_TEMP/scanned-image.tar" | cut -d ' ' -f 1)"
+          printf '%s\n' "$image_id" > "$RUNNER_TEMP/scanned-image.id"
+          printf '%s  %s\n' "$archive_sha256" scanned-image.tar > "$RUNNER_TEMP/scanned-image.tar.sha256"
+          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+          echo "archive_sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
+      - name: Scan image for HIGH and CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: stage1-validation:${{ github.sha }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+          vuln-type: os,library
+          cache: 'false'
+      - name: Upload the scanned image and identity metadata
+        if: ${{ inputs.publish_image }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scanned-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/scanned-image.tar
+            ${{ runner.temp }}/scanned-image.id
+            ${{ runner.temp }}/scanned-image.tar.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish non-production image
+    if: ${{ inputs.publish_image && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.repository == github.event.repository.full_name && github.event.repository.fork != true }}
+    needs: [validate, build-and-test, secret-scan, dependency-scan, sonar, container]
+    runs-on: ubuntu-latest
+    environment:
+      name: non-production
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    outputs:
+      image_uri: ${{ steps.push.outputs.image_uri }}
+      image_digest: ${{ steps.push.outputs.image_digest }}
+    steps:
+      - name: Download scanned image artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: scanned-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/scanned-image
+      - name: Verify and load the exact scanned image
+        shell: bash
+        env:
+          LOCAL_IMAGE: stage1-validation:${{ github.sha }}
+          EXPECTED_IMAGE_ID: ${{ needs.container.outputs.image_id }}
+          EXPECTED_ARCHIVE_SHA256: ${{ needs.container.outputs.archive_sha256 }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/scanned-image"
+          sha256sum --check scanned-image.tar.sha256
+          expected_image_id="$(cat scanned-image.id)"
+          [[ "$expected_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$expected_image_id" == "$EXPECTED_IMAGE_ID" ]] || { echo '::error::Image identity metadata differs from the container job output.'; exit 1; }
+          expected_archive_sha256="$(cut -d ' ' -f 1 scanned-image.tar.sha256)"
+          [[ "$expected_archive_sha256" == "$EXPECTED_ARCHIVE_SHA256" ]] || { echo '::error::Image archive metadata differs from the container job output.'; exit 1; }
+          docker image load --input scanned-image.tar
+          actual_image_id="$(docker image inspect --format='{{.Id}}' "$LOCAL_IMAGE")"
+          [[ "$actual_image_id" == "$expected_image_id" ]] || { echo '::error::Downloaded image does not match the scanned image ID.'; exit 1; }
+      - name: Publish to GHCR and verify the remote image digest
+        id: push
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          REQUESTED_IMAGE_NAME: ${{ inputs.image_name }}
+          REPOSITORY: ${{ github.repository }}
+          LOCAL_IMAGE: stage1-validation:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$REQUESTED_IMAGE_NAME" ]]; then
+            image_name="$REQUESTED_IMAGE_NAME"
+          else
+            image_name="ghcr.io/${REPOSITORY,,}"
+          fi
+          image_uri="$image_name:${GITHUB_SHA}"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag "$LOCAL_IMAGE" "$image_uri"
+          docker push "$image_uri"
+          manifest="$(docker buildx imagetools inspect --raw "$image_uri")"
+          remote_config="$(printf '%s' "$manifest" | jq -r '.config.digest // empty')"
+          expected_config="$(docker image inspect --format='{{.Id}}' "$image_uri")"
+          [[ -n "$remote_config" && "$remote_config" == "$expected_config" ]] || { echo '::error::Published GHCR image does not match the scanned image config digest.'; exit 1; }
+          image_digest="sha256:$(printf '%s' "$manifest" | sha256sum | cut -d ' ' -f 1)"
+          echo '::add-mask::'"$GHCR_TOKEN"
+          echo "image_uri=$image_uri" >> "$GITHUB_OUTPUT"
+          echo "image_digest=$image_digest" >> "$GITHUB_OUTPUT"
+
+  required-checks:
+    name: Stage 1 Required Checks
+    if: ${{ always() }}
+    needs: [validate, build-and-test, secret-scan, dependency-scan, sonar, container, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Report gate results and enforce required checks
+        shell: python
+        env:
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          BUILD_TEST_RESULT: ${{ needs.build-and-test.result }}
+          SECRET_RESULT: ${{ needs.secret-scan.result }}
+          DEPENDENCY_RESULT: ${{ needs.dependency-scan.result }}
+          SONAR_RESULT: ${{ needs.sonar.result }}
+          CONTAINER_RESULT: ${{ needs.container.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          RUN_CONTAINER_CHECKS: ${{ inputs.run_container_checks }}
+          PUBLISH_IMAGE: ${{ inputs.publish_image }}
+        run: |
+          import os
+          from pathlib import Path
+
+          publish_requested = os.environ["PUBLISH_IMAGE"] == "true"
+          container_requested = os.environ["RUN_CONTAINER_CHECKS"] == "true" or publish_requested
+          gates = [
+              ("Validation", "VALIDATE_RESULT", True),
+              ("Build and test", "BUILD_TEST_RESULT", True),
+              ("Gitleaks", "SECRET_RESULT", True),
+              ("OSV dependencies", "DEPENDENCY_RESULT", True),
+              ("SonarQube Cloud Quality Gate", "SONAR_RESULT", True),
+              ("Container build and Trivy", "CONTAINER_RESULT", container_requested),
+              ("Image publication", "PUBLISH_RESULT", publish_requested),
+          ]
+          lines = [
+              "## Stage 1 Required Checks",
+              "",
+              "| Check | Expected | Result | Gate |",
+              "| --- | --- | --- | --- |",
+          ]
+          failures = []
+          for name, result_variable, required in gates:
+              result = os.environ.get(result_variable, "unknown")
+              if result not in {"success", "failure", "cancelled", "skipped"}:
+                  result = "unknown"
+              expected = "success" if required else "skipped"
+              passed = result == expected
+              verdict = ("Passed" if required else "Not requested") if passed else "Failed"
+              lines.append(f"| {name} | {expected} | {result} | {verdict} |")
+              if not passed:
+                  failures.append(f"{name}: expected {expected}, got {result}.")
+
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              summary.write("\n".join(lines) + "\n")
+          for failure in failures:
+              print(f"::error::{failure}")
+          raise SystemExit(1 if failures else 0)

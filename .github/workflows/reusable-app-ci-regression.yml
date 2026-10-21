@@ -1,0 +1,29 @@
+name: Reusable workflow regression
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+
+jobs:
+  python-consumer:
+    name: Python consumer regression
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/reusable-app-ci.yml
+    with:
+      language: python
+      working_directory: tests/consumer-repo/python-app
+      python_version: '3.12'
+      sonar_organization: ${{ vars.SONAR_REGRESSION_ORGANIZATION }}
+      sonar_project_key: ${{ vars.SONAR_REGRESSION_PROJECT_KEY }}
+      run_container_checks: false
+      publish_image: false
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_REGRESSION_TOKEN }}
