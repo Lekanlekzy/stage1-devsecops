@@ -27,5 +27,5 @@ jobs:
       sonar_project_key: Lekanlekzy_stage1-devsecops
       run_container_checks: false
       publish_image: false
-    # secrets:
-    #   SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
