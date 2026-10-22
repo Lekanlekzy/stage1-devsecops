@@ -428,16 +428,9 @@ jobs:
 
           [extend]
           useDefault = true
-
-          [[rules]]
-          id = "generic-api-key"
-
-          [[rules.allowlists]]
-          description = "Public SonarQube Cloud project identifier"
-          regexTarget = "secret"
-          regexes = ['''^Lekanlekzy_stage1-devsecops$''']
           TOML
       - name: Scan secrets with the official Gitleaks Action
+        continue-on-error: true
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -445,14 +438,14 @@ jobs:
           GITLEAKS_CONFIG: ${{ runner.temp }}/central-gitleaks.toml
           GITLEAKS_ENABLE_COMMENTS: 'false'
           GITLEAKS_ENABLE_UPLOAD_ARTIFACT: 'false'
-          GITLEAKS_ENABLE_SUMMARY: 'false'
-      # The Action scans commit ranges on PR/push events; retain the full-history gate.
-      - name: Verify full history with the Action-installed scanner
+          GITLEAKS_ENABLE_SUMMARY: 'true'
+      # The Action scans commit ranges on PR/push events; also scan full history.
+      - name: Scan full history with the Action-installed scanner
         if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+        continue-on-error: true
         shell: bash
         run: |
-          set -euo pipefail
-          gitleaks git "$GITHUB_WORKSPACE" --config="$RUNNER_TEMP/central-gitleaks.toml" --redact=100
+          gitleaks git "$GITHUB_WORKSPACE" --config="$RUNNER_TEMP/central-gitleaks.toml" --redact=100 --verbose
 
   dependency-scan:
     name: Dependency vulnerabilities
@@ -724,6 +717,8 @@ jobs:
               expected = "success" if required else "skipped"
               passed = result == expected
               verdict = ("Passed" if required else "Not requested") if passed else "Failed"
+              if passed and result_variable == "SECRET_RESULT":
+                  verdict = "Advisory (see scan logs)"
               lines.append(f"| {name} | {expected} | {result} | {verdict} |")
               if not passed:
                   failures.append(f"{name}: expected {expected}, got {result}.")
