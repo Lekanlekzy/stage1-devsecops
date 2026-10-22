@@ -397,7 +397,7 @@ jobs:
           retention-days: 1
 
   secret-scan:
-    name: Secret scan
+    name: Gitleak scan
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -419,7 +419,7 @@ jobs:
             --volume "$GITHUB_WORKSPACE:/repo:ro" \
             --volume "$config:/central-gitleaks.toml:ro" \
             ghcr.io/gitleaks/gitleaks:v8.30.0@sha256:691af3c7c5a48b16f187ce3446d5f194838f91238f27270ed36eef6359a574d9 \
-            git --source=/repo --config=/central-gitleaks.toml --redact=100
+            git /repo --config=/central-gitleaks.toml --redact=100
 
   dependency-scan:
     name: Dependency vulnerabilities
