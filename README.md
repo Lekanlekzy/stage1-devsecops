@@ -12,8 +12,8 @@ Every caller also runs the mandatory SonarQube Cloud Quality Gate, full-history 
 
 - **Validation** checks the caller's inputs and required files.
 - **Build and test** resolves profile build paths, installs the selected toolchain, and runs that profile's formatting, lint, and unit-test commands. Build output follows the selected profile's conventions.
-- **Secret and dependency scans** run as separate jobs. Gitleaks fetches full Git history; OSV fails when it finds a vulnerable dependency.
-- **SonarQube Cloud** runs in its own job. Only this job receives the project-scoped `SONAR_TOKEN`. For Java, compiled bytecode is passed from the build-and-test job as a short-lived artifact so the Sonar job does not run application build scripts with the token.
+- **Secret and dependency scans** run as separate jobs. The official Gitleaks Action scans fetched Git history; OSV fails when it finds a vulnerable dependency.
+- **SonarQube Cloud** runs in its own job. Only this job receives the project-scoped `SONAR_TOKEN`. Java bytecode and Python coverage reports pass from the build-and-test job as short-lived artifacts, so the Sonar job does not run application build or test scripts with the token.
 - **Container build and scan** runs only when requested. It adds OCI labels for the source repository, commit, title, build time, and workflow run, then scans locally without package-write credentials. Publication stays in the same reusable workflow as a separate job, enabled with `publish_image: true` only after every required gate passes.
 - **Stage 1 Required Checks** writes a table of expected and actual job results to the GitHub run summary before reporting the aggregate result. It fails if a mandatory gate fails, or if an optional job that was requested does not succeed. Disabled optional jobs appear as `Not requested` only when they were skipped. The same table includes optional container checks and image publication.
 
@@ -25,7 +25,7 @@ GitHub-hosted jobs use separate, short-lived runners with separate workspaces. A
 - [`reusable-app-ci-regression.yml`](.github/workflows/reusable-app-ci-regression.yml) calls the central workflow against the Python fixture in [`tests/consumer-repo`](tests/consumer-repo/). It runs for pull requests to `main` and manual dispatch. It skips fork and Dependabot pull requests because those runs do not receive the regression Sonar secret.
 - [`main-protection.yml.disabled`](.github/workflows/main-protection.yml.disabled) is intentionally disabled for now. Its retained definition runs the local contract tests, actionlint, and zizmor when restored to a `.yml` filename. GitHub rulesets or classic branch protection separately enforce merge rules; disabling this file does not change remote repository settings.
 
-For the secret-backed regression, configure the `SONAR_REGRESSION_PROJECT_KEY` Actions variable and use the existing `SONAR_TOKEN` secret, authorized to analyze that project. The Sonar organization is fixed to `lekanlekzy`. Never use `pull_request_target` to work around fork-secret restrictions.
+The regression caller explicitly targets `Lekanlekzy_stage1-devsecops`; no project-key variable is needed. Configure the existing `SONAR_TOKEN` secret with permission to analyze that project. The Sonar organization is fixed to `lekanlekzy`. Never use `pull_request_target` to work around fork-secret restrictions.
 
 ## Local checks
 
@@ -35,13 +35,17 @@ Run the dependency-free repository contract suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
-Run the Python fixture's unit test from PowerShell:
+Run the Python fixture checks and generate Sonar's coverage report from PowerShell:
 
 ```powershell
 Set-Location tests/consumer-repo/python-app
-$env:PYTHONPATH = (Resolve-Path src).Path
-python -m unittest discover -s test -v
+python -m pip install -e '.[dev]'
+python -m ruff check .
+python -m ruff format --check .
+python -m pytest --cov --cov-report=xml:coverage.xml
 ```
+
+Python callers include pytest, pytest-cov, and Ruff in their `[dev]` extra. The fixture configures relative coverage paths and source scope in `pyproject.toml`; its `coverage.xml` is imported by Sonar. See the [workflow contract](docs/stage-1/reusable-workflow-contract.md#python-coverage) for caller configuration.
 
 Local tests do not verify GitHub Actions execution, SonarQube Cloud configuration or Quality Gate behavior, scanner service results, GHCR permissions, observed status-check names, or repository branch rules. The central workflow's integration behavior must be checked in a configured GitHub caller repository.
 
