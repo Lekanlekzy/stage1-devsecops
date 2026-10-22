@@ -20,7 +20,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
-      actions: read
       contents: read
     steps:
       - name: Check out repository without persisted credentials

@@ -13,8 +13,8 @@ jobs:
   python-consumer:
     name: Python consumer regression
     if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
+    # Ceiling for the single reusable workflow; only its guarded publisher gets write access.
     permissions:
-      actions: read
       contents: read
       packages: write
     uses: ./.github/workflows/reusable-app-ci.yml

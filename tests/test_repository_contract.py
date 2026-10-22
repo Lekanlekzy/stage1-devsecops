@@ -115,7 +115,9 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}", WORKFLOW)
         self.assertIn("-Dsonar.qualitygate.wait=true", WORKFLOW)
         self.assertIn("-Dsonar.qualitygate.timeout=300", WORKFLOW)
-        self.assertIn("fail-on-vuln: true", WORKFLOW)
+        self.assertIn("scan source --recursive --no-ignore --no-call-analysis=all", WORKFLOW)
+        self.assertIn('--config="$config"', WORKFLOW)
+        self.assertIn("sha256sum --check --status", WORKFLOW)
         self.assertIn("exit-code: '1'", WORKFLOW)
         self.assertIn("--redact=100", WORKFLOW)
         self.assertIn("useDefault = true", WORKFLOW)
@@ -164,6 +166,8 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("name: non-production", publish_job)
         self.assertNotIn("actions/checkout", publish_job)
         self.assertIn("needs: [validate, build-and-test, secret-scan, dependency-scan, sonar, container]", publish_job)
+        self.assertIn("if: ${{ inputs.publish_image &&", publish_job)
+        self.assertNotIn("always()", publish_job)
 
         safe = dict(
             requested=True,
@@ -237,11 +241,11 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("actual default branch", runbook)
         self.assertIn("does not enforce", runbook)
 
-    def test_regression_caller_runs_reusable_workflow_on_main_prs_and_pushes(self) -> None:
+    def test_regression_caller_runs_reusable_workflow_on_main_prs_and_manual_dispatch(self) -> None:
         caller_path = ROOT / ".github" / "workflows" / "reusable-app-ci-regression.yml"
         caller = caller_path.read_text(encoding="utf-8")
         self.assertIn("pull_request:", caller)
-        self.assertIn("push:", caller)
+        self.assertIn("workflow_dispatch:", caller)
         self.assertIn("branches: [main]", caller)
         self.assertIn("uses: ./.github/workflows/reusable-app-ci.yml", caller)
         self.assertIn("working_directory: tests/consumer-repo/python-app", caller)
@@ -257,15 +261,17 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertTrue((fixture / "test" / "test_calculator.py").is_file())
         self.assertFalse((ROOT / "examples" / "config").exists())
 
-    def test_callers_map_only_named_secret_and_keep_publish_permissions_separate(self) -> None:
+    def test_callers_map_only_named_secret_and_declare_the_required_permission_ceiling(self) -> None:
         caller = (ROOT / "examples" / "caller-workflows" / "python-app.yml.example").read_text(encoding="utf-8")
         publisher = (ROOT / "examples" / "caller-workflows" / "publish-image.yml.example").read_text(encoding="utf-8")
         self.assertIn("SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}", caller)
         self.assertIn("publish_image: false", caller)
-        self.assertIn("actions: read", caller)
-        self.assertNotIn("packages: write", caller)
+        self.assertNotIn("actions: read", caller)
+        self.assertIn("packages: write", caller)
         self.assertIn("packages: write", publisher)
+        self.assertIn("run_container_checks: true", publisher)
         self.assertIn("publish_image: true", publisher)
+        self.assertIn("/.github/workflows/reusable-app-ci.yml@main", publisher)
 
 
 class RequiredChecksTests(unittest.TestCase):
@@ -339,12 +345,16 @@ class RequiredChecksTests(unittest.TestCase):
             {"RUN_CONTAINER_CHECKS": "true", "CONTAINER_RESULT": "failure"},
             {"CONTAINER_RESULT": "success"},
             {"PUBLISH_RESULT": "success"},
-            {
-                "RUN_CONTAINER_CHECKS": "true",
-                "PUBLISH_IMAGE": "true",
-                "CONTAINER_RESULT": "success",
-                "PUBLISH_RESULT": "cancelled",
-            },
+            {"PUBLISH_IMAGE": "true", "CONTAINER_RESULT": "skipped", "PUBLISH_RESULT": "success"},
+            *(
+                {
+                    "RUN_CONTAINER_CHECKS": "true",
+                    "PUBLISH_IMAGE": "true",
+                    "CONTAINER_RESULT": "success",
+                    "PUBLISH_RESULT": result,
+                }
+                for result in ("skipped", "failure", "cancelled", "unknown")
+            ),
         ):
             with self.subTest(configuration=configuration):
                 completed, summary = self.run_gate(**configuration)
