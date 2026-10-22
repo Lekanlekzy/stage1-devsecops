@@ -13,10 +13,11 @@ jobs:
   python-consumer:
     name: Python consumer regression
     if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
-    # Required permissions for the nested OSV scan and optional image publisher.
+    # Required permissions for the scanners and optional image publisher.
     permissions:
       actions: read
       contents: read
+      pull-requests: read
       security-events: write
       packages: write
     uses: ./.github/workflows/reusable-app-ci.yml

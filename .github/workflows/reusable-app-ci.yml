@@ -403,23 +403,35 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      pull-requests: read
     steps:
       - name: Check out caller history without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Scan full Git history with centrally fixed Gitleaks defaults
+      - name: Prepare the central Gitleaks configuration
         shell: bash
         run: |
           set -euo pipefail
           config="$RUNNER_TEMP/central-gitleaks.toml"
           printf 'title = "Central Gitleaks baseline"\n\n[extend]\nuseDefault = true\n' > "$config"
-          docker run --rm \
-            --volume "$GITHUB_WORKSPACE:/repo:ro" \
-            --volume "$config:/central-gitleaks.toml:ro" \
-            ghcr.io/gitleaks/gitleaks:v8.30.0@sha256:691af3c7c5a48b16f187ce3446d5f194838f91238f27270ed36eef6359a574d9 \
-            git /repo --config=/central-gitleaks.toml --redact=100
+      - name: Scan secrets with the official Gitleaks Action
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_VERSION: '8.30.0'
+          GITLEAKS_CONFIG: ${{ runner.temp }}/central-gitleaks.toml
+          GITLEAKS_ENABLE_COMMENTS: 'false'
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: 'false'
+          GITLEAKS_ENABLE_SUMMARY: 'false'
+      # The Action scans commit ranges on PR/push events; retain the full-history gate.
+      - name: Verify full history with the Action-installed scanner
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gitleaks git "$GITHUB_WORKSPACE" --config="$RUNNER_TEMP/central-gitleaks.toml" --redact=100
 
   dependency-scan:
     name: Dependency vulnerabilities
