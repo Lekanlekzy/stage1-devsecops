@@ -47,10 +47,6 @@ on:
         required: false
         type: string
         default: 1.27.x
-      sonar_organization:
-        description: Existing SonarQube Cloud organization key.
-        required: true
-        type: string
       sonar_project_key:
         description: Non-secret key of the existing SonarQube Cloud project that receives this application's analysis.
         required: true
@@ -87,8 +83,7 @@ on:
         description: Published image manifest digest, empty when publication is disabled.
         value: ${{ jobs.publish.outputs.image_digest }}
 
-permissions:
-  contents: read
+permissions: {}
 
 
 jobs:
@@ -111,7 +106,6 @@ jobs:
           LANGUAGE: ${{ inputs.language }}
           NODE_TYPESCRIPT: ${{ inputs.node_typescript }}
           DOTNET_PROJECT: ${{ inputs.dotnet_project }}
-          SONAR_ORGANIZATION: ${{ inputs.sonar_organization }}
           SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key }}
           RUN_CONTAINER_CHECKS: ${{ inputs.run_container_checks }}
           PUBLISH_IMAGE: ${{ inputs.publish_image }}
@@ -198,7 +192,6 @@ jobs:
               ;;
           esac
 
-          [[ "$SONAR_ORGANIZATION" =~ ^[A-Za-z0-9_-]+$ ]] || fail "sonar_organization contains unsupported characters."
           [[ "$SONAR_PROJECT_KEY" =~ ^[A-Za-z0-9_.:-]+$ ]] || fail "sonar_project_key contains unsupported characters."
           python3 - "$APP_DIR" "sonar-project.properties" <<'PY'
           import os
@@ -434,10 +427,14 @@ jobs:
     permissions:
       actions: read
       contents: read
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@c7c7bcb0773cc4678a674ada03a66cc5c4325476 # v2.6.0
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@c7c7bcb0773cc4678a674ada03a66cc5c4325476 # scanner v2.6.0
     with:
       scan-args: |-
         --recursive
+        --no-ignore
+        --no-call-analysis=all
+        --config=/dev/null
         ./
       upload-sarif: false
       fail-on-vuln: true
@@ -448,7 +445,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
-      actions: read
       contents: read
     steps:
       - name: Check out caller source without persisted credentials
@@ -504,7 +500,7 @@ jobs:
           projectBaseDir: ${{ inputs.working_directory }}
           args: >-
             -Dsonar.host.url=https://sonarcloud.io
-            -Dsonar.organization=${{ inputs.sonar_organization }}
+            -Dsonar.organization=lekanlekzy
             -Dsonar.projectKey=${{ inputs.sonar_project_key }}
             -Dsonar.qualitygate.wait=true
             -Dsonar.qualitygate.timeout=300
@@ -583,8 +579,6 @@ jobs:
       name: non-production
     timeout-minutes: 15
     permissions:
-      actions: read
-      contents: read
       packages: write
     outputs:
       image_uri: ${{ steps.push.outputs.image_uri }}
