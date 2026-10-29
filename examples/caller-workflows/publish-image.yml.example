@@ -16,13 +16,15 @@ jobs:
   publish:
     name: Publish after required validation
     permissions:
+      actions: read
       contents: read
+      pull-requests: read
+      security-events: write
       packages: write
     uses: Lekanlekzy/stage1-devsecops/.github/workflows/reusable-app-ci.yml@main
     with:
       language: python
       working_directory: .
-      sonar_organization: ${{ vars.SONAR_ORGANIZATION }}
       sonar_project_key: ${{ vars.SONAR_PROJECT_KEY }}
       container_context: .
       run_container_checks: true

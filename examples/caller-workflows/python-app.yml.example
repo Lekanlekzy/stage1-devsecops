@@ -14,16 +14,18 @@ permissions:
 jobs:
   application-ci:
     name: Application CI
-    # Ceiling for the single reusable workflow; only its guarded publisher gets write access.
+    # Permission ceiling for scanners and optional image publication.
     permissions:
+      actions: read
       contents: read
+      pull-requests: read
+      security-events: write
       packages: write
     uses: Lekanlekzy/stage1-devsecops/.github/workflows/reusable-app-ci.yml@main
     with:
       language: python
       working_directory: .
       python_version: '3.12'
-      sonar_organization: ${{ vars.SONAR_ORGANIZATION }}
       sonar_project_key: ${{ vars.SONAR_PROJECT_KEY }}
       run_container_checks: false
       publish_image: false

@@ -71,6 +71,11 @@ on:
         required: false
         type: string
         default: ''
+      package_app:
+        description: Build a ready-to-run Node ZIP for the separate deployment workflow.
+        required: false
+        type: boolean
+        default: false
     secrets:
       SONAR_TOKEN:
         description: SonarQube Cloud analysis token, scoped to this project.
@@ -82,6 +87,15 @@ on:
       image_digest:
         description: Published image manifest digest, empty when publication is disabled.
         value: ${{ jobs.publish.outputs.image_digest }}
+      app_package_artifact_id:
+        description: Node ZIP artifact ID after successful CI, empty when packaging is disabled.
+        value: ${{ jobs.required-checks.outputs.app_package_artifact_id }}
+      app_package_sha256:
+        description: Node ZIP SHA-256 after successful CI, empty when packaging is disabled.
+        value: ${{ jobs.required-checks.outputs.app_package_sha256 }}
+      app_revision:
+        description: Packaged commit after successful CI, empty when packaging is disabled.
+        value: ${{ jobs.required-checks.outputs.app_revision }}
 
 permissions: {}
 
@@ -97,6 +111,7 @@ jobs:
       - name: Check out caller repository without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Validate profile and caller configuration
         id: validate-inputs
@@ -111,7 +126,12 @@ jobs:
           PUBLISH_IMAGE: ${{ inputs.publish_image }}
           CONTAINER_CONTEXT: ${{ inputs.container_context }}
           IMAGE_NAME: ${{ inputs.image_name }}
+          PACKAGE_APP: ${{ inputs.package_app }}
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          MERGED_REVISION: ${{ github.event.pull_request.merge_commit_sha }}
+          RUN_REVISION: ${{ github.sha }}
           REF_NAME: ${{ github.ref }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           REPOSITORY: ${{ github.repository }}
@@ -124,6 +144,11 @@ jobs:
             echo "::error::$1"
             exit 1
           }
+
+          if [[ "$EVENT_NAME" == pull_request && "$EVENT_ACTION" == closed ]]; then
+            [[ "$PR_MERGED" == true ]] || fail "Post-merge CI requires a merged pull request."
+            [[ -n "$MERGED_REVISION" && "$RUN_REVISION" == "$MERGED_REVISION" ]] || fail "Post-merge CI must validate the exact revision merged into the base branch."
+          fi
 
           case "$LANGUAGE" in
             java-maven|java-gradle|python|node|dotnet|go) ;;
@@ -160,8 +185,9 @@ jobs:
           const fs = require('node:fs');
           const project = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
           const scripts = project.scripts || {};
-          const required = ['lint', 'format:check', 'test:ci'];
+          const required = ['lint', 'format:check', 'build', 'test:ci'];
           if (process.env.NODE_TYPESCRIPT === 'true') required.push('typecheck');
+          if (process.env.PACKAGE_APP === 'true') required.push('package:ci');
           const missing = required.filter((name) => !scripts[name]);
           if (missing.length) {
             console.error(`::error::node requires npm scripts: ${missing.join(', ')}.`);
@@ -217,6 +243,10 @@ jobs:
           PY
           fi
 
+          if [[ "$PACKAGE_APP" == true ]]; then
+            [[ "$LANGUAGE" == node ]] || fail "Application packaging currently supports the node profile only."
+          fi
+
           if [[ "$PUBLISH_IMAGE" == true ]]; then
             [[ "$RUN_CONTAINER_CHECKS" == true ]] || fail "publish_image requires run_container_checks=true."
             [[ "$EVENT_NAME" == push ]] || fail "Image publication is allowed only for push events on the default branch."
@@ -242,10 +272,14 @@ jobs:
       contents: read
     outputs:
       sonar_java_binaries: ${{ steps.build-paths.outputs.sonar_java_binaries }}
+      app_package_sha256: ${{ steps.app-package.outputs.sha256 }}
+      app_package_artifact_id: ${{ steps.upload-app-package.outputs.artifact-id }}
+      node_coverage_artifact_id: ${{ steps.upload-node-coverage.outputs.artifact-id }}
     steps:
       - name: Check out caller repository without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Resolve profile build paths
         id: build-paths
@@ -347,7 +381,56 @@ jobs:
           npm run lint
           npm run format:check
           if [[ "$NODE_TYPESCRIPT" == true ]]; then npm run typecheck; fi
+          npm run build
           npm run test:ci
+      - name: Prepare the Node application package
+        if: ${{ inputs.package_app }}
+        working-directory: ${{ inputs.working_directory }}
+        shell: bash
+        run: npm run package:ci
+      - name: Archive the Node application package and record its identity
+        if: ${{ inputs.package_app }}
+        id: app-package
+        working-directory: ${{ inputs.working_directory }}
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import os
+          import zipfile
+          from pathlib import Path
+
+          root = Path("deploy")
+          if root.is_symlink() or not root.is_dir() or not (root / "package.json").is_file():
+              raise SystemExit("::error::package:ci must create deploy/package.json and a ready-to-run Node application.")
+          files = sorted(root.rglob("*"))
+          if any(path.is_symlink() for path in files):
+              raise SystemExit("::error::Deployment packages must not contain symbolic links.")
+          manifest = root / "release.json"
+          manifest.write_text(json.dumps({"revision": os.environ["GITHUB_SHA"]}), encoding="utf-8")
+          archive_path = Path(os.environ["RUNNER_TEMP"]) / "app.zip"
+          with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(root.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, path.relative_to(root).as_posix())
+          with archive_path.open("rb") as package:
+              digest = hashlib.file_digest(package, "sha256").hexdigest()
+          (archive_path.parent / "app.zip.sha256").write_text(digest + "\n", encoding="utf-8")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"sha256={digest}\n")
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              summary.write(f"## Application package\n\nRevision: `{os.environ['GITHUB_SHA']}`\n\nSHA-256: `{digest}`\n")
+      - name: Upload the application package for deployment and rollback
+        if: ${{ inputs.package_app }}
+        id: upload-app-package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: node-app-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/app.zip
+            ${{ runner.temp }}/app.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
       - name: Run .NET format validation and unit tests
         if: ${{ inputs.language == 'dotnet' }}
         working-directory: ${{ inputs.working_directory }}
@@ -373,6 +456,15 @@ jobs:
           fi
           go vet ./...
           go test ./...
+      - name: Upload Node coverage for Sonar analysis
+        if: ${{ inputs.language == 'node' }}
+        id: upload-node-coverage
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sonar-node-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ inputs.working_directory }}/coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 1
       - name: Upload Python coverage for Sonar analysis
         if: ${{ inputs.language == 'python' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -416,6 +508,7 @@ jobs:
       - name: Check out caller history without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Prepare the central Gitleaks configuration
@@ -476,8 +569,16 @@ jobs:
       - name: Check out caller source without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Download Node coverage for Sonar analysis
+        if: ${{ inputs.language == 'node' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build-and-test.outputs.node_coverage_artifact_id }}
+          merge-multiple: true
+          path: ${{ inputs.working_directory }}/coverage
       - name: Download Python coverage for Sonar analysis
         if: ${{ inputs.language == 'python' }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -536,6 +637,8 @@ jobs:
             -Dsonar.projectKey=${{ inputs.sonar_project_key }}
             -Dsonar.qualitygate.wait=true
             -Dsonar.qualitygate.timeout=300
+            ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && format('-Dsonar.branch.name={0}', github.event.pull_request.base.ref) || '' }}
+            ${{ inputs.language == 'node' && '-Dsonar.javascript.lcov.reportPaths=coverage/lcov.info' || '' }}
             ${{ inputs.language == 'python' && '-Dsonar.python.coverage.reportPaths=coverage.xml' || '' }}
             ${{ needs.build-and-test.outputs.sonar_java_binaries != '' && format('-Dsonar.java.binaries={0}', needs.build-and-test.outputs.sonar_java_binaries) || '' }}
 
@@ -554,6 +657,7 @@ jobs:
       - name: Check out caller repository without persisted credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Build local image without registry credentials
         id: image
@@ -675,8 +779,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
+    outputs:
+      app_package_artifact_id: ${{ steps.gates.outputs.app_package_artifact_id }}
+      app_package_sha256: ${{ steps.gates.outputs.app_package_sha256 }}
+      app_revision: ${{ steps.gates.outputs.app_revision }}
     steps:
       - name: Report gate results and enforce required checks
+        id: gates
         shell: python
         env:
           VALIDATE_RESULT: ${{ needs.validate.result }}
@@ -688,6 +797,10 @@ jobs:
           PUBLISH_RESULT: ${{ needs.publish.result }}
           RUN_CONTAINER_CHECKS: ${{ inputs.run_container_checks }}
           PUBLISH_IMAGE: ${{ inputs.publish_image }}
+          PACKAGE_APP: ${{ inputs.package_app }}
+          APP_PACKAGE_ARTIFACT_ID: ${{ needs.build-and-test.outputs.app_package_artifact_id }}
+          APP_PACKAGE_SHA256: ${{ needs.build-and-test.outputs.app_package_sha256 }}
+          APP_REVISION: ${{ github.sha }}
         run: |
           import os
           from pathlib import Path
@@ -727,4 +840,10 @@ jobs:
               summary.write("\n".join(lines) + "\n")
           for failure in failures:
               print(f"::error::{failure}")
-          raise SystemExit(1 if failures else 0)
+          if failures:
+              raise SystemExit(1)
+          if os.environ.get("PACKAGE_APP") == "true":
+              with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+                  output.write(f"app_package_artifact_id={os.environ['APP_PACKAGE_ARTIFACT_ID']}\n")
+                  output.write(f"app_package_sha256={os.environ['APP_PACKAGE_SHA256']}\n")
+                  output.write(f"app_revision={os.environ['APP_REVISION']}\n")
