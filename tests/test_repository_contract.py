@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -66,7 +67,7 @@ def profile_configuration_valid(
     if profile not in required_files or not required_files[profile].issubset(files):
         return False
     if profile == "node":
-        required = {"lint", "format:check", "test:ci", "typecheck"}
+        required = {"lint", "format:check", "build", "test:ci", "typecheck"}
         return required.issubset(node_scripts or set())
     return True
 
@@ -99,12 +100,15 @@ class WorkflowContractTests(unittest.TestCase):
             "node_version",
             "dotnet_version",
             "go_version",
-            "sonar_organization",
             "sonar_project_key",
             "run_container_checks",
             "publish_image",
+            "package_app",
         ):
             self.assertRegex(WORKFLOW, rf"(?m)^      {re.escape(input_name)}:")
+        self.assertNotIn("sonar_organization", WORKFLOW)
+        self.assertIn("-Dsonar.organization=lekanlekzy", WORKFLOW)
+        self.assertNotIn("GITLEAKS_LICENSE", WORKFLOW)
         self.assertIn("image_uri:", WORKFLOW)
         self.assertIn("image_digest:", WORKFLOW)
         self.assertIn("value: ${{ jobs.publish.outputs.image_uri }}", WORKFLOW)
@@ -115,14 +119,31 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}", WORKFLOW)
         self.assertIn("-Dsonar.qualitygate.wait=true", WORKFLOW)
         self.assertIn("-Dsonar.qualitygate.timeout=300", WORKFLOW)
-        self.assertIn("scan source --recursive --no-ignore --no-call-analysis=all", WORKFLOW)
-        self.assertIn('--config="$config"', WORKFLOW)
-        self.assertIn("sha256sum --check --status", WORKFLOW)
+        self.assertIn("osv-scanner-reusable.yml@c7c7bcb0773cc4678a674ada03a66cc5c4325476", WORKFLOW)
+        self.assertIn("fail-on-vuln: true", WORKFLOW)
+        self.assertIn("upload-sarif: false", WORKFLOW)
+        self.assertIn("--no-ignore", WORKFLOW)
+        self.assertIn("--no-call-analysis=all", WORKFLOW)
+        self.assertIn("--config=/dev/null", WORKFLOW)
         self.assertIn("exit-code: '1'", WORKFLOW)
         self.assertIn("--redact=100", WORKFLOW)
+        self.assertIn("gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e", WORKFLOW)
+        self.assertIn("GITLEAKS_VERSION: '8.30.0'", WORKFLOW)
+        self.assertIn("GITLEAKS_CONFIG: ${{ runner.temp }}/central-gitleaks.toml", WORKFLOW)
+        self.assertIn('gitleaks git "$GITHUB_WORKSPACE" --config="$RUNNER_TEMP/central-gitleaks.toml" --redact=100 --verbose', WORKFLOW)
+        self.assertIn("GITLEAKS_ENABLE_COMMENTS: 'false'", WORKFLOW)
+        self.assertIn("GITLEAKS_ENABLE_UPLOAD_ARTIFACT: 'false'", WORKFLOW)
+        self.assertNotIn("git --source", WORKFLOW)
         self.assertIn("useDefault = true", WORKFLOW)
         self.assertNotIn("secrets: inherit", WORKFLOW)
-        self.assertNotRegex(WORKFLOW, r"(?m)^\s*continue-on-error:\s*true\s*$")
+        self.assertEqual(len(re.findall(r"(?m)^\s*continue-on-error:\s*true\s*$", WORKFLOW)), 2)
+        secret_scan = WORKFLOW.split("\n  secret-scan:\n", 1)[1].split("\n  dependency-scan:\n", 1)[0]
+        self.assertEqual(secret_scan.count("continue-on-error: true"), 2)
+        self.assertIn("GITLEAKS_ENABLE_SUMMARY: 'true'", secret_scan)
+        self.assertNotIn("gitleaks-result", WORKFLOW)
+        self.assertNotIn("ACTION_EXIT_CODE", WORKFLOW)
+        self.assertNotIn("SECRET_FINDINGS", WORKFLOW)
+        self.assertIn("Advisory (see scan logs)", WORKFLOW)
 
     def test_missing_profile_configuration_is_rejected(self) -> None:
         self.assertIn("Unsupported language profile", WORKFLOW)
@@ -139,6 +160,39 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertFalse(profile_configuration_valid("dotnet", set(), dotnet_projects=0))
         self.assertFalse(profile_configuration_valid("dotnet", set(), dotnet_projects=2))
 
+    def test_gitleaks_uses_default_rules_without_project_exceptions(self) -> None:
+        config_text = WORKFLOW.split("<<'TOML'\n", 1)[1].split("\n          TOML", 1)[0]
+        config = tomllib.loads(textwrap.dedent(config_text))
+        self.assertEqual(config, {
+            "title": "Central Gitleaks baseline",
+            "extend": {"useDefault": True},
+        })
+
+    def test_python_coverage_is_transferred_to_the_isolated_sonar_job(self) -> None:
+        build = WORKFLOW.split("\n  build-and-test:\n", 1)[1].split("\n  secret-scan:\n", 1)[0]
+        sonar = WORKFLOW.split("\n  sonar:\n", 1)[1].split("\n  container:\n", 1)[0]
+        self.assertIn("python -m pytest --cov --cov-report=xml:coverage.xml", build)
+        upload = build.split("- name: Upload Python coverage for Sonar analysis\n", 1)[1].split("      - name:", 1)[0]
+        download = sonar.split("- name: Download Python coverage for Sonar analysis\n", 1)[1].split("      - name:", 1)[0]
+        for step in (upload, download):
+            self.assertIn("if: ${{ inputs.language == 'python' }}", step)
+            self.assertIn("name: sonar-python-coverage-${{ github.run_id }}-${{ github.run_attempt }}", step)
+        self.assertIn("actions/upload-artifact@", upload)
+        self.assertIn("path: ${{ inputs.working_directory }}/coverage.xml", upload)
+        self.assertIn("if-no-files-found: error", upload)
+        self.assertIn("retention-days: 1", upload)
+        self.assertIn("actions/download-artifact@", download)
+        self.assertIn("path: ${{ inputs.working_directory }}", download)
+        self.assertIn("-Dsonar.python.coverage.reportPaths=coverage.xml", sonar)
+        self.assertNotIn("SONAR_TOKEN", build)
+        self.assertNotIn("python -m pytest", sonar)
+
+        fixture = ROOT / "tests/consumer-repo/python-app"
+        project = tomllib.loads((fixture / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertTrue(any(dependency.startswith("pytest-cov==") for dependency in project["project"]["optional-dependencies"]["dev"]))
+        self.assertEqual(project["tool"]["coverage"]["run"], {"relative_files": True, "source": ["src"], "branch": True})
+        self.assertIn("sonar.python.coverage.reportPaths=coverage.xml", (fixture / "sonar-project.properties").read_text(encoding="utf-8"))
+
     def test_node_profile_requires_each_declared_ci_script(self) -> None:
         self.assertFalse(
             profile_configuration_valid(
@@ -151,7 +205,7 @@ class WorkflowContractTests(unittest.TestCase):
             profile_configuration_valid(
                 "node",
                 {"package.json", "package-lock.json"},
-                node_scripts={"lint", "format:check", "test:ci", "typecheck"},
+                node_scripts={"lint", "format:check", "build", "test:ci", "typecheck"},
             )
         )
 
@@ -249,7 +303,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("branches: [main]", caller)
         self.assertIn("uses: ./.github/workflows/reusable-app-ci.yml", caller)
         self.assertIn("working_directory: tests/consumer-repo/python-app", caller)
-        self.assertIn("SONAR_TOKEN: ${{ secrets.SONAR_REGRESSION_TOKEN }}", caller)
+        self.assertIn("SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}", caller)
         self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", caller)
         self.assertIn("github.actor != 'dependabot[bot]'", caller)
         self.assertIn("publish_image: false", caller)
@@ -265,8 +319,11 @@ class WorkflowContractTests(unittest.TestCase):
         caller = (ROOT / "examples" / "caller-workflows" / "python-app.yml.example").read_text(encoding="utf-8")
         publisher = (ROOT / "examples" / "caller-workflows" / "publish-image.yml.example").read_text(encoding="utf-8")
         self.assertIn("SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}", caller)
+        self.assertNotIn("GITLEAKS_LICENSE", caller)
         self.assertIn("publish_image: false", caller)
-        self.assertNotIn("actions: read", caller)
+        self.assertIn("actions: read", caller)
+        self.assertIn("pull-requests: read", caller)
+        self.assertIn("security-events: write", caller)
         self.assertIn("packages: write", caller)
         self.assertIn("packages: write", publisher)
         self.assertIn("run_container_checks: true", publisher)
