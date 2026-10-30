@@ -1,0 +1,34 @@
+# Optional publishing caller for the same Stage 1 reusable workflow.
+# Replace main with the application repository's actual default branch.
+# The central workflow uses main while the first release is pending; adopt an
+# approved release tag or full commit SHA when one is available.
+# Create and protect the caller repository's non-production environment first.
+name: Publish non-production image
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish after required validation
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      security-events: write
+      packages: write
+    uses: Lekanlekzy/stage1-devsecops/.github/workflows/reusable-app-ci.yml@main
+    with:
+      language: python
+      working_directory: .
+      sonar_project_key: ${{ vars.SONAR_PROJECT_KEY }}
+      container_context: .
+      run_container_checks: true
+      publish_image: true
+      # image_name omitted: defaults to ghcr.io/<caller-owner>/<caller-repo>
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

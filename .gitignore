@@ -1,0 +1,27 @@
+.env
+.env.*
+!.env.example
+*.tfstate
+*.tfstate.*
+.terraform/
+coverage/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+.venv/
+node_modules/
+bin/
+obj/
+
+# Python build output and generated package metadata
+__pycache__/
+*.py[cod]
+dist/
+build/
+*.egg-info/
+.eggs/
+*.egg
+*.whl
+pip-wheel-metadata/
