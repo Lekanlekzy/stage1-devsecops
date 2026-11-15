@@ -1,4 +1,8 @@
-FROM python:3.12-slim
+# FROM python:3.12-slim
+FROM python:3.12-alpine3.24
+# RUN apt-get update \
+#     && apt-get upgrade -y --no-install-recommends \
+#     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
