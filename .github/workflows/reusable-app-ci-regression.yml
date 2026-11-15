@@ -19,6 +19,7 @@ jobs:
       contents: read
       pull-requests: read
       security-events: write
+      packages: write
     uses: ./.github/workflows/reusable-app-ci.yml
     with:
       language: python
