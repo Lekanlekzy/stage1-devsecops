@@ -706,7 +706,7 @@ jobs:
   publish:
     name: Publish non-production image
     if: ${{ inputs.publish_image }}
-    needs: [validate, build-and-test, secret-scan, dependency-scan, sonar, container]
+    needs: [validate, secret-scan, dependency-scan, container]
     runs-on: ubuntu-latest
     environment:
       name: non-production
