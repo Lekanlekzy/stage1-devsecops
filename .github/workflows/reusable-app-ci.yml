@@ -742,6 +742,7 @@ jobs:
           GHCR_TOKEN: ${{ github.token }}
           REQUESTED_IMAGE_NAME: ${{ inputs.image_name }}
           REPOSITORY: ${{ github.repository }}
+          EXPECTED_IMAGE_ID: ${{ needs.container.outputs.image_id }}
           LOCAL_IMAGE: stage1-validation:${{ github.sha }}
         run: |
           set -euo pipefail
@@ -750,14 +751,35 @@ jobs:
           else
             image_name="ghcr.io/${REPOSITORY,,}"
           fi
+          echo "Image name: $image_name"
           image_uri="$image_name:${GITHUB_SHA}"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           docker tag "$LOCAL_IMAGE" "$image_uri"
           docker push "$image_uri"
           manifest="$(docker buildx imagetools inspect --raw "$image_uri")"
+          local_os="$(docker image inspect --format='{{.Os}}' "$LOCAL_IMAGE")"
+          local_architecture="$(docker image inspect --format='{{.Architecture}}' "$LOCAL_IMAGE")"
+          local_platform="$local_os/$local_architecture"
           remote_config="$(printf '%s' "$manifest" | jq -r '.config.digest // empty')"
-          expected_config="$(docker image inspect --format='{{.Id}}' "$image_uri")"
-          [[ -n "$remote_config" && "$remote_config" == "$expected_config" ]] || { echo '::error::Published GHCR image does not match the scanned image config digest.'; exit 1; }
+          if [[ -z "$remote_config" ]]; then
+            platform_manifest_digest="$(printf '%s' "$manifest" | jq -r --arg os "$local_os" --arg architecture "$local_architecture" '
+              [.manifests[]? | select(.platform.os == $os and .platform.architecture == $architecture) | .digest]
+              | if length == 1 then .[0] else empty end' || true)"
+            [[ -n "$platform_manifest_digest" ]] || {
+              echo "::error::GHCR manifest index has no unique image manifest for scanned platform $local_platform."
+              exit 1
+            }
+            platform_manifest="$(docker buildx imagetools inspect --raw "$image_uri@$platform_manifest_digest")"
+            remote_config="$(printf '%s' "$platform_manifest" | jq -r '.config.digest // empty')"
+          fi
+          [[ -n "$remote_config" ]] || {
+            echo "::error::Could not read the published GHCR image config digest for platform $local_platform."
+            exit 1
+          }
+          [[ "$remote_config" == "$EXPECTED_IMAGE_ID" ]] || {
+            echo "::error::Published GHCR image does not match the scanned image config digest (platform $local_platform; expected $EXPECTED_IMAGE_ID; registry $remote_config)."
+            exit 1
+          }
           image_digest="sha256:$(printf '%s' "$manifest" | sha256sum | cut -d ' ' -f 1)"
           echo '::add-mask::'"$GHCR_TOKEN"
           echo "image_uri=$image_uri" >> "$GITHUB_OUTPUT"
