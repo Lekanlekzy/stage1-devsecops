@@ -671,11 +671,11 @@ jobs:
             --tag "$LOCAL_IMAGE" "$CONTAINER_CONTEXT"
           docker image save --output "$RUNNER_TEMP/scanned-image.tar" "$LOCAL_IMAGE"
           config_path="$(tar -xOf "$RUNNER_TEMP/scanned-image.tar" manifest.json | jq -er '.[0].Config')"
-          [[ "$config_path" =~ ^[0-9a-f]{64}\.json$ ]] || {
-            echo "::error::Docker image archive has an unexpected config path."
+          [[ -n "$config_path" ]] || {
+            echo "::error::Docker image archive has no config path."
             exit 1
           }
-          image_config_digest="sha256:$(tar -xOf "$RUNNER_TEMP/scanned-image.tar" "$config_path" | sha256sum | cut -d ' ' -f 1)"
+          image_config_digest="sha256:$(tar -xOf "$RUNNER_TEMP/scanned-image.tar" -- "$config_path" | sha256sum | cut -d ' ' -f 1)"
           archive_sha256="$(sha256sum "$RUNNER_TEMP/scanned-image.tar" | cut -d ' ' -f 1)"
           printf '%s\n' "$image_config_digest" > "$RUNNER_TEMP/scanned-image.config-digest"
           printf '%s  %s\n' "$archive_sha256" scanned-image.tar > "$RUNNER_TEMP/scanned-image.tar.sha256"
