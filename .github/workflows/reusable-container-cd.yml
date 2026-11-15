@@ -1,0 +1,278 @@
+name: Central reusable container CD
+
+on:
+  workflow_call:
+    inputs:
+      image_uri:
+        description: Commit-tagged GHCR image output from successful central CI.
+        required: true
+        type: string
+      image_digest:
+        description: SHA-256 manifest digest output from successful central CI.
+        required: true
+        type: string
+      app_revision:
+        description: Commit built into the image and returned by its health endpoint.
+        required: true
+        type: string
+      azure_container_app_name:
+        description: Existing non-production Azure Container App.
+        required: true
+        type: string
+      azure_container_name:
+        description: Container in the Container App to update.
+        required: true
+        type: string
+      azure_resource_group:
+        description: Resource group containing the Container App.
+        required: true
+        type: string
+      azure_client_id:
+        description: Client ID of the identity federated with the caller's non-production environment.
+        required: true
+        type: string
+      azure_tenant_id:
+        description: Azure tenant ID.
+        required: true
+        type: string
+      azure_subscription_id:
+        description: Azure subscription ID.
+        required: true
+        type: string
+      health_check_path:
+        description: HTTPS JSON endpoint returning status ok and the deployed revision.
+        required: false
+        type: string
+        default: /healthz
+    outputs:
+      deployment_url:
+        description: Azure Container App URL after health and revision verification.
+        value: ${{ jobs.deploy.outputs.url }}
+      deployed_image:
+        description: Immutable GHCR image reference deployed by digest.
+        value: ${{ jobs.deploy.outputs.image_ref }}
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: Deploy and verify non-production Azure Container App
+    if: >-
+      ${{ github.event_name == 'push'
+          && github.event.repository.default_branch != ''
+          && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+          && github.repository == github.event.repository.full_name
+          && github.event.repository.fork != true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+    environment:
+      name: non-production
+      url: ${{ steps.health.outputs.deployment_url }}
+    outputs:
+      url: ${{ steps.health.outputs.deployment_url }}
+      image_ref: ${{ steps.prepare.outputs.image_ref }}
+    steps:
+      - name: Validate image, revision, and Azure configuration
+        id: prepare
+        shell: python
+        env:
+          IMAGE_URI: ${{ inputs.image_uri }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          APP_REVISION: ${{ inputs.app_revision }}
+          AZURE_CONTAINER_APP_NAME: ${{ inputs.azure_container_app_name }}
+          AZURE_CONTAINER_NAME: ${{ inputs.azure_container_name }}
+          AZURE_RESOURCE_GROUP: ${{ inputs.azure_resource_group }}
+          AZURE_CLIENT_ID: ${{ inputs.azure_client_id }}
+          AZURE_TENANT_ID: ${{ inputs.azure_tenant_id }}
+          AZURE_SUBSCRIPTION_ID: ${{ inputs.azure_subscription_id }}
+          HEALTH_CHECK_PATH: ${{ inputs.health_check_path }}
+        run: |
+          import os
+          import re
+          from pathlib import Path
+
+          revision = os.environ["APP_REVISION"]
+          if not re.fullmatch(r"[0-9a-f]{40}", revision) or revision != os.environ["GITHUB_SHA"]:
+              raise SystemExit("::error::app_revision must be this workflow run's 40-character commit.")
+          image_uri = os.environ["IMAGE_URI"]
+          match = re.fullmatch(
+              r"ghcr\.io/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*:([0-9a-f]{40})",
+              image_uri,
+          )
+          if not match or match.group(1) != revision:
+              raise SystemExit("::error::image_uri must be a GHCR image tagged with app_revision.")
+          digest = os.environ["IMAGE_DIGEST"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("::error::image_digest must be a SHA-256 manifest digest.")
+          app_name = os.environ["AZURE_CONTAINER_APP_NAME"]
+          if (
+              not re.fullmatch(r"[a-z][a-z0-9-]{0,30}[a-z0-9]", app_name)
+              or "--" in app_name
+          ):
+              raise SystemExit("::error::azure_container_app_name must be a valid Azure Container App name.")
+          container_name = os.environ["AZURE_CONTAINER_NAME"]
+          if (
+              not re.fullmatch(r"[a-z][a-z0-9-]{0,30}[a-z0-9]", container_name)
+              or "--" in container_name
+          ):
+              raise SystemExit("::error::azure_container_name must be a valid container name.")
+          if not re.fullmatch(r"[A-Za-z0-9._()-]{1,90}", os.environ["AZURE_RESOURCE_GROUP"]):
+              raise SystemExit("::error::azure_resource_group contains unsupported characters.")
+          for name in ("AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_SUBSCRIPTION_ID"):
+              if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", os.environ[name]):
+                  raise SystemExit(f"::error::{name} must be configured as a UUID.")
+          path = os.environ["HEALTH_CHECK_PATH"]
+          if not re.fullmatch(r"/[A-Za-z0-9/_-]*", path) or path.startswith("//"):
+              raise SystemExit("::error::health_check_path must be an absolute application path.")
+          image_ref = image_uri.rsplit(":", 1)[0] + "@" + digest
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"image_ref={image_ref}\n")
+
+      - name: Authenticate to Azure with the caller's federated identity
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ inputs.azure_client_id }}
+          tenant-id: ${{ inputs.azure_tenant_id }}
+          subscription-id: ${{ inputs.azure_subscription_id }}
+
+      - name: Deploy the exact scanned image digest to Azure Container Apps
+        id: containerapp
+        uses: azure/cli@9eb25b8360668fb0ecbafa808d40e2197b2f5f52 # v3.0.0
+        env:
+          AZURE_CONTAINER_APP_NAME: ${{ inputs.azure_container_app_name }}
+          AZURE_CONTAINER_NAME: ${{ inputs.azure_container_name }}
+          AZURE_RESOURCE_GROUP: ${{ inputs.azure_resource_group }}
+          CONTAINER_IMAGE_REF: ${{ steps.prepare.outputs.image_ref }}
+        with:
+          azcliversion: 2.91.0
+          inlineScript: |
+            set -euo pipefail
+            APP_NAME="$AZURE_CONTAINER_APP_NAME"
+            CONTAINER_NAME="$AZURE_CONTAINER_NAME"
+            RESOURCE_GROUP="$AZURE_RESOURCE_GROUP"
+            IMAGE_REF="$CONTAINER_IMAGE_REF"
+
+            revision_mode="$(az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --query properties.configuration.activeRevisionsMode --output tsv)"
+            external_ingress="$(az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.external --output tsv)"
+            fqdn="$(az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn --output tsv)"
+            container_names="$(az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --query 'properties.template.containers[].name' --output tsv)"
+
+            if [[ "$external_ingress" != "true" || -z "$fqdn" || "$fqdn" == "None" ]]; then
+              echo "::error::The Azure Container App must have external HTTPS ingress enabled for health verification."
+              exit 1
+            fi
+            if ! printf '%s\n' "$container_names" | grep -Fxq -- "$CONTAINER_NAME"; then
+              echo "::error::azure_container_name does not match a container configured in the Azure Container App."
+              exit 1
+            fi
+            case "$revision_mode" in
+              Single|single|Multiple|multiple) ;;
+              *)
+                echo "::error::Could not determine the Azure Container App revision mode."
+                exit 1
+                ;;
+            esac
+
+            az containerapp update \
+              --name "$APP_NAME" \
+              --resource-group "$RESOURCE_GROUP" \
+              --container-name "$CONTAINER_NAME" \
+              --image "$IMAGE_REF" \
+              --only-show-errors \
+              --output none
+
+            revision=""
+            provisioning_state=""
+            for attempt in $(seq 1 60); do
+              revision="$(az containerapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --query properties.latestRevisionName --output tsv)"
+              if [[ -n "$revision" && "$revision" != "None" ]]; then
+                provisioning_state="$(az containerapp revision show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --revision "$revision" --query properties.provisioningState --output tsv)"
+                if [[ "$provisioning_state" == "Provisioned" ]]; then
+                  break
+                fi
+                if [[ "$provisioning_state" == "Failed" ]]; then
+                  echo "::error::Azure Container Apps reported that the new revision failed to provision."
+                  exit 1
+                fi
+              fi
+              echo "Waiting for the new Azure Container Apps revision to provision..."
+              sleep 5
+            done
+            if [[ "$provisioning_state" != "Provisioned" ]]; then
+              echo "::error::The new Azure Container Apps revision did not provision within 300 seconds."
+              exit 1
+            fi
+
+            deployed_image="$(az containerapp revision show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --revision "$revision" --query "properties.template.containers[?name=='$CONTAINER_NAME'].image | [0]" --output tsv)"
+            if [[ "$deployed_image" != "$IMAGE_REF" ]]; then
+              echo "::error::The latest Azure Container Apps revision does not use the requested image digest."
+              exit 1
+            fi
+
+            revision_mode_lc="$(printf '%s' "$revision_mode" | tr '[:upper:]' '[:lower:]')"
+            if [[ "$revision_mode_lc" == "multiple" ]]; then
+              az containerapp ingress traffic set \
+                --name "$APP_NAME" \
+                --resource-group "$RESOURCE_GROUP" \
+                --revision-weight latest=100 \
+                --only-show-errors \
+                --output none
+            fi
+
+            printf 'deployment_url=https://%s\n' "$fqdn" >> "$GITHUB_OUTPUT"
+            printf 'revision=%s\n' "$revision" >> "$GITHUB_OUTPUT"
+
+      - name: Verify application health and deployed revision
+        id: health
+        shell: python
+        env:
+          APP_URL: ${{ steps.containerapp.outputs.deployment_url }}
+          HEALTH_CHECK_PATH: ${{ inputs.health_check_path }}
+          EXPECTED_REVISION: ${{ inputs.app_revision }}
+          IMAGE_REF: ${{ steps.prepare.outputs.image_ref }}
+          AZURE_REVISION: ${{ steps.containerapp.outputs.revision }}
+        run: |
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          base = os.environ["APP_URL"].rstrip("/")
+          parsed = urllib.parse.urlsplit(base)
+          if parsed.scheme != "https" or not parsed.hostname:
+              raise SystemExit("::error::Deployment did not return an HTTPS Azure Container Apps URL.")
+          deadline = time.monotonic() + 600
+          while time.monotonic() < deadline:
+              try:
+                  request = urllib.request.Request(
+                      base + os.environ["HEALTH_CHECK_PATH"],
+                      headers={"Cache-Control": "no-cache"},
+                  )
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      health = json.loads(response.read(65537))
+                      if response.status != 200 or not isinstance(health, dict):
+                          raise ValueError("health endpoint did not return a JSON object with HTTP 200")
+                      if health.get("status") != "ok" or health.get("revision") != os.environ["EXPECTED_REVISION"]:
+                          raise ValueError("health status or deployed revision does not match")
+                  with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+                      summary.write(
+                          "## Non-production Azure Container Apps deployment\n\n"
+                          f"URL: {base}\n\n"
+                          f"Image: {os.environ['IMAGE_REF']}\n\n"
+                          f"Revision: {os.environ['EXPECTED_REVISION']}\n\n"
+                          f"Azure revision: {os.environ['AZURE_REVISION']}\n\n"
+                          "Health and revision checks: passed\n"
+                      )
+                  with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+                      output.write(f"deployment_url={base}\n")
+                  break
+              except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
+                  print("Waiting for the expected Azure Container Apps revision to become healthy...")
+                  time.sleep(5)
+          else:
+              raise SystemExit("::error::Container App did not pass health and revision checks within 600 seconds.")

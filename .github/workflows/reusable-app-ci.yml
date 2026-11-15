@@ -673,6 +673,7 @@ jobs:
           set -euo pipefail
           created_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           docker build --pull --progress=plain \
+            --build-arg "APP_REVISION=$IMAGE_REVISION" \
             --label "org.opencontainers.image.source=$IMAGE_SOURCE" \
             --label "org.opencontainers.image.url=$IMAGE_URL" \
             --label "org.opencontainers.image.title=$IMAGE_TITLE" \

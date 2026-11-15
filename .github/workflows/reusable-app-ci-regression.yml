@@ -13,20 +13,20 @@ jobs:
   python-consumer:
     name: Python consumer regression
     if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
-    # Permission ceiling for scanners and optional image publication.
+    # The image is built and scanned locally; this regression caller never publishes it.
     permissions:
       actions: read
       contents: read
       pull-requests: read
       security-events: write
-      packages: write
     uses: ./.github/workflows/reusable-app-ci.yml
     with:
       language: python
       working_directory: tests/consumer-repo/python-app
       python_version: '3.12'
       sonar_project_key: Lekanlekzy_stage1-devsecops
-      run_container_checks: false
+      run_container_checks: true
+      container_context: tests/consumer-repo/python-app
       publish_image: false
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
