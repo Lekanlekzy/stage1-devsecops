@@ -640,7 +640,7 @@ jobs:
     permissions:
       contents: read
     outputs:
-      image_id: ${{ steps.image.outputs.image_id }}
+      image_config_digest: ${{ steps.image.outputs.image_config_digest }}
       archive_sha256: ${{ steps.image.outputs.archive_sha256 }}
     steps:
       - name: Check out caller repository without persisted credentials
@@ -670,11 +670,16 @@ jobs:
             --label "org.opencontainers.image.created=$created_at" \
             --tag "$LOCAL_IMAGE" "$CONTAINER_CONTEXT"
           docker image save --output "$RUNNER_TEMP/scanned-image.tar" "$LOCAL_IMAGE"
-          image_id="$(docker image inspect --format='{{.Id}}' "$LOCAL_IMAGE")"
+          config_path="$(tar -xOf "$RUNNER_TEMP/scanned-image.tar" manifest.json | jq -er '.[0].Config')"
+          [[ "$config_path" =~ ^[0-9a-f]{64}\.json$ ]] || {
+            echo "::error::Docker image archive has an unexpected config path."
+            exit 1
+          }
+          image_config_digest="sha256:$(tar -xOf "$RUNNER_TEMP/scanned-image.tar" "$config_path" | sha256sum | cut -d ' ' -f 1)"
           archive_sha256="$(sha256sum "$RUNNER_TEMP/scanned-image.tar" | cut -d ' ' -f 1)"
-          printf '%s\n' "$image_id" > "$RUNNER_TEMP/scanned-image.id"
+          printf '%s\n' "$image_config_digest" > "$RUNNER_TEMP/scanned-image.config-digest"
           printf '%s  %s\n' "$archive_sha256" scanned-image.tar > "$RUNNER_TEMP/scanned-image.tar.sha256"
-          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+          echo "image_config_digest=$image_config_digest" >> "$GITHUB_OUTPUT"
           echo "archive_sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
       - name: Scan image for HIGH and CRITICAL vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -693,7 +698,7 @@ jobs:
           name: scanned-image-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/scanned-image.tar
-            ${{ runner.temp }}/scanned-image.id
+            ${{ runner.temp }}/scanned-image.config-digest
             ${{ runner.temp }}/scanned-image.tar.sha256
           if-no-files-found: error
           retention-days: 1
@@ -721,20 +726,19 @@ jobs:
         shell: bash
         env:
           LOCAL_IMAGE: stage1-validation:${{ github.sha }}
-          EXPECTED_IMAGE_ID: ${{ needs.container.outputs.image_id }}
+          EXPECTED_CONFIG_DIGEST: ${{ needs.container.outputs.image_config_digest }}
           EXPECTED_ARCHIVE_SHA256: ${{ needs.container.outputs.archive_sha256 }}
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/scanned-image"
           sha256sum --check scanned-image.tar.sha256
-          expected_image_id="$(cat scanned-image.id)"
-          [[ "$expected_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ "$expected_image_id" == "$EXPECTED_IMAGE_ID" ]] || { echo '::error::Image identity metadata differs from the container job output.'; exit 1; }
+          expected_config_digest="$(cat scanned-image.config-digest)"
+          [[ "$expected_config_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$expected_config_digest" == "$EXPECTED_CONFIG_DIGEST" ]] || { echo '::error::Image config digest metadata differs from the container job output.'; exit 1; }
           expected_archive_sha256="$(cut -d ' ' -f 1 scanned-image.tar.sha256)"
           [[ "$expected_archive_sha256" == "$EXPECTED_ARCHIVE_SHA256" ]] || { echo '::error::Image archive metadata differs from the container job output.'; exit 1; }
           docker image load --input scanned-image.tar
-          actual_image_id="$(docker image inspect --format='{{.Id}}' "$LOCAL_IMAGE")"
-          [[ "$actual_image_id" == "$expected_image_id" ]] || { echo '::error::Downloaded image does not match the scanned image ID.'; exit 1; }
+          docker image inspect "$LOCAL_IMAGE" >/dev/null
       - name: Publish to GHCR and verify the remote image digest
         id: push
         shell: bash
@@ -742,7 +746,7 @@ jobs:
           GHCR_TOKEN: ${{ github.token }}
           REQUESTED_IMAGE_NAME: ${{ inputs.image_name }}
           REPOSITORY: ${{ github.repository }}
-          EXPECTED_IMAGE_ID: ${{ needs.container.outputs.image_id }}
+          EXPECTED_CONFIG_DIGEST: ${{ needs.container.outputs.image_config_digest }}
           LOCAL_IMAGE: stage1-validation:${{ github.sha }}
         run: |
           set -euo pipefail
@@ -762,7 +766,7 @@ jobs:
             echo "::error::Could not read the published GHCR manifest digest from docker push output."
             exit 1
           }
-          echo "Scanned image config digest: $EXPECTED_IMAGE_ID"
+          echo "Scanned image config digest: $EXPECTED_CONFIG_DIGEST"
           echo "Published image manifest digest: $image_digest"
           published_ref="$image_name@$image_digest"
           manifest="$(docker buildx imagetools inspect --raw "$published_ref")"
@@ -785,8 +789,8 @@ jobs:
             echo "::error::Could not read the published GHCR image config digest for platform $local_platform."
             exit 1
           }
-          [[ "$remote_config" == "$EXPECTED_IMAGE_ID" ]] || {
-            echo "::error::Published GHCR image does not match the scanned image config digest (platform $local_platform; published manifest $image_digest; expected $EXPECTED_IMAGE_ID; registry $remote_config)."
+          [[ "$remote_config" == "$EXPECTED_CONFIG_DIGEST" ]] || {
+            echo "::error::Published GHCR image does not match the scanned image config digest (platform $local_platform; published manifest $image_digest; expected $EXPECTED_CONFIG_DIGEST; registry $remote_config)."
             exit 1
           }
           echo '::add-mask::'"$GHCR_TOKEN"
