@@ -58,7 +58,16 @@ jobs:
   deploy:
     name: Deploy and verify non-production Azure Container App
     if: >-
-      ${{ github.event_name == 'push'
+      ${{ (
+            github.event_name == 'push'
+            || github.event_name == 'workflow_dispatch'
+            || (github.event_name == 'pull_request'
+                && github.event.action == 'closed'
+                && github.event.pull_request.merged == true
+                && github.event.pull_request.base.ref == github.event.repository.default_branch
+                && github.sha == github.event.pull_request.merge_commit_sha
+                && github.event.pull_request.head.repo.full_name == github.repository)
+          )
           && github.event.repository.default_branch != ''
           && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
           && github.repository == github.event.repository.full_name
