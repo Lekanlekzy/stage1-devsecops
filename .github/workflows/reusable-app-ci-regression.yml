@@ -28,6 +28,6 @@ jobs:
       sonar_project_key: Lekanlekzy_stage1-devsecops
       run_container_checks: true
       container_context: tests/consumer-repo/python-app
-      publish_image: false
+      publish_image: true
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
