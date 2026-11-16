@@ -755,12 +755,39 @@ jobs:
           else
             image_name="ghcr.io/${REPOSITORY,,}"
           fi
-          echo "Image name: $image_name"
           image_uri="$image_name:${GITHUB_SHA}"
+          image_metadata="$(docker image inspect "$LOCAL_IMAGE")"
+          local_os="$(printf '%s' "$image_metadata" | jq -er '.[0].Os')"
+          local_architecture="$(printf '%s' "$image_metadata" | jq -er '.[0].Architecture')"
+          local_variant="$(printf '%s' "$image_metadata" | jq -r '.[0].Variant // empty')"
+          local_platform="$local_os/$local_architecture${local_variant:+/$local_variant}"
+          [[ "$local_platform" =~ ^[a-z0-9]+/[a-z0-9_]+(/[a-z0-9_.-]+)?$ ]] || { echo '::error::Loaded image has an invalid platform.'; exit 1; }
+          image_source="$(printf '%s' "$image_metadata" | jq -r '.[0].Config.Labels["org.opencontainers.image.source"] // empty')"
+          image_revision="$(printf '%s' "$image_metadata" | jq -r '.[0].Config.Labels["org.opencontainers.image.revision"] // empty')"
+          [[ "$image_source" == "$GITHUB_SERVER_URL/$REPOSITORY" ]] || { echo '::error::Loaded image source label does not match the caller repository.'; exit 1; }
+          [[ "$image_revision" == "$GITHUB_SHA" ]] || { echo '::error::Loaded image revision label does not match this run.'; exit 1; }
+          docker version --format 'Docker client={{.Client.Version}} server={{.Server.Version}} API={{.Server.APIVersion}}'
+          printf 'Caller: %s\nEvent: %s\nRun: %s/%s/actions/runs/%s\nImage URI: %s\nPlatform: %s\nSource: %s\nRevision: %s\n' \
+            "$REPOSITORY" "$GITHUB_EVENT_NAME" "$GITHUB_SERVER_URL" "$REPOSITORY" "$GITHUB_RUN_ID" \
+            "$image_uri" "$local_platform" "$image_source" "$image_revision"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           docker tag "$LOCAL_IMAGE" "$image_uri"
           push_log="$RUNNER_TEMP/docker-push.log"
-          docker push "$image_uri" 2>&1 | tee "$push_log"
+          push_succeeded=false
+          for attempt in 1 2 3; do
+            if docker push --platform "$local_platform" "$image_uri" 2>&1 | tee "$push_log"; then
+              push_succeeded=true
+              break
+            fi
+            if [[ "$attempt" -lt 3 ]]; then
+              printf '::warning::GHCR push attempt %s failed; retrying the same scanned image in 10 seconds.\n' "$attempt"
+              sleep 10
+            fi
+          done
+          [[ "$push_succeeded" == true ]] || {
+            echo '::error::GHCR rejected image publication after three attempts; no deployment outputs will be returned.'
+            exit 1
+          }
           image_digest="$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}) size: [0-9]+.*/\1/p' "$push_log" | tail -n 1)"
           [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
             echo "::error::Could not read the published GHCR manifest digest from docker push output."
@@ -770,9 +797,6 @@ jobs:
           echo "Published image manifest digest: $image_digest"
           published_ref="$image_name@$image_digest"
           manifest="$(docker buildx imagetools inspect --raw "$published_ref")"
-          local_os="$(docker image inspect --format='{{.Os}}' "$LOCAL_IMAGE")"
-          local_architecture="$(docker image inspect --format='{{.Architecture}}' "$LOCAL_IMAGE")"
-          local_platform="$local_os/$local_architecture"
           remote_config="$(printf '%s' "$manifest" | jq -r '.config.digest // empty')"
           if [[ -z "$remote_config" ]]; then
             platform_manifest_digest="$(printf '%s' "$manifest" | jq -r --arg os "$local_os" --arg architecture "$local_architecture" '
