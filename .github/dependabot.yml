@@ -8,3 +8,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+
+  - package-ecosystem: docker
+    directory: /tests/consumer-repo/python-app
+    schedule:
+      interval: weekly

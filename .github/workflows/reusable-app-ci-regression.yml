@@ -3,6 +3,7 @@ name: Reusable workflow regression
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, closed]
   workflow_dispatch:
 
 permissions:
@@ -12,8 +13,11 @@ permissions:
 jobs:
   python-consumer:
     name: Python consumer regression
-    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
-    # Permission ceiling for scanners and optional image publication.
+    if: >-
+      ${{ github.event_name != 'pull_request'
+          || (github.event.pull_request.head.repo.full_name == github.repository
+              && github.actor != 'dependabot[bot]'
+              && (github.event.action != 'closed' || github.event.pull_request.merged == true)) }}
     permissions:
       actions: read
       contents: read
@@ -26,7 +30,26 @@ jobs:
       working_directory: tests/consumer-repo/python-app
       python_version: '3.12'
       sonar_project_key: Lekanlekzy_stage1-devsecops
-      run_container_checks: false
-      publish_image: false
+      run_container_checks: true
+      container_context: tests/consumer-repo/python-app
+      publish_image: true
     secrets:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # deploy:
+  #   name: Deploy merged container image
+  #   needs: python-consumer
+  #   permissions:
+  #     id-token: write
+  #   uses: ./.github/workflows/reusable-container-cd.yml
+  #   with:
+  #     image_uri: ${{ needs['python-consumer'].outputs.image_uri }}
+  #     image_digest: ${{ needs['python-consumer'].outputs.image_digest }}
+  #     app_revision: ${{ github.sha }}
+  #     azure_container_app_name: ${{ vars.AZURE_CONTAINER_APP_NAME }}
+  #     azure_container_name: ${{ vars.AZURE_CONTAINER_NAME }}
+  #     azure_resource_group: ${{ vars.AZURE_RESOURCE_GROUP }}
+  #     azure_client_id: ${{ vars.AZURE_CLIENT_ID }}
+  #     azure_tenant_id: ${{ vars.AZURE_TENANT_ID }}
+  #     azure_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  #     health_check_path: /healthz
