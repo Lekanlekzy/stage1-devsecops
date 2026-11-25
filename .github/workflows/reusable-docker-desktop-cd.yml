@@ -1,0 +1,146 @@
+name: Central reusable Docker Desktop CD
+
+on:
+  workflow_call:
+    inputs:
+      image_registry:
+        description: Registry containing the public image: ghcr or dockerhub.
+        required: true
+        type: string
+      image_uri:
+        description: Commit-tagged image output from successful central CI.
+        required: true
+        type: string
+      image_digest:
+        description: SHA-256 manifest digest output from successful central CI.
+        required: true
+        type: string
+      app_revision:
+        description: Commit built into the image and returned by its health endpoint.
+        required: true
+        type: string
+      container_name:
+        description: Name of the Docker Desktop container to replace.
+        required: true
+        type: string
+      host_port:
+        description: Local host TCP port to publish.
+        required: false
+        type: number
+        default: 8080
+      container_port:
+        description: TCP port exposed by the application in the container.
+        required: false
+        type: number
+        default: 8080
+      health_check_url:
+        description: Local HTTP health URL returning status ok and the deployed revision.
+        required: false
+        type: string
+        default: http://localhost:8080/healthz
+    outputs:
+      deployment_url:
+        description: Local health URL after verification.
+        value: ${{ jobs.deploy.outputs.url }}
+      deployed_image:
+        description: Immutable image reference deployed by digest.
+        value: ${{ jobs.deploy.outputs.image_ref }}
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: Deploy and verify Docker Desktop
+    if: >-
+      ${{ (
+            github.event_name == 'workflow_dispatch'
+            || (github.event_name == 'pull_request'
+                && github.event.action == 'closed'
+                && github.event.pull_request.merged == true
+                && github.event.pull_request.base.ref == github.event.repository.default_branch
+                && github.sha == github.event.pull_request.merge_commit_sha
+                && github.event.pull_request.head.repo.full_name == github.repository)
+          )
+          && github.event.repository.default_branch != ''
+          && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+          && github.repository == github.event.repository.full_name
+          && github.event.repository.fork != true }}
+    runs-on: [self-hosted, windows, docker-desktop]
+    timeout-minutes: 30
+    permissions: {}
+    environment:
+      name: non-production
+      url: ${{ steps.health.outputs.deployment_url }}
+    outputs:
+      url: ${{ steps.health.outputs.deployment_url }}
+      image_ref: ${{ steps.prepare.outputs.image_ref }}
+    steps:
+      - name: Validate image and local Docker configuration
+        id: prepare
+        shell: pwsh
+        env:
+          IMAGE_REGISTRY: ${{ inputs.image_registry }}
+          IMAGE_URI: ${{ inputs.image_uri }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          APP_REVISION: ${{ inputs.app_revision }}
+          CONTAINER_NAME: ${{ inputs.container_name }}
+          HOST_PORT: ${{ inputs.host_port }}
+          CONTAINER_PORT: ${{ inputs.container_port }}
+          HEALTH_CHECK_URL: ${{ inputs.health_check_url }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:APP_REVISION -notmatch '^[0-9a-f]{40}$' -or $env:APP_REVISION -ne $env:GITHUB_SHA) { throw '::error::app_revision must be this workflow run''s 40-character commit.' }
+          switch ($env:IMAGE_REGISTRY) {
+            'ghcr' { $imagePattern = '^ghcr\.io/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*:[0-9a-f]{40}$' }
+            'dockerhub' { $imagePattern = '^[a-z0-9]+(?:[._-][a-z0-9]+)*/[a-z0-9]+(?:[._-][a-z0-9]+)*:[0-9a-f]{40}$' }
+            default { throw '::error::image_registry must be ghcr or dockerhub.' }
+          }
+          if ($env:IMAGE_URI -notmatch $imagePattern) { throw '::error::image_uri does not match the selected public registry.' }
+          if ($env:IMAGE_URI.Split(':')[-1] -ne $env:APP_REVISION) { throw '::error::image_uri tag must equal app_revision.' }
+          if ($env:IMAGE_DIGEST -notmatch '^sha256:[0-9a-f]{64}$') { throw '::error::image_digest must be a SHA-256 manifest digest.' }
+          if ($env:CONTAINER_NAME -notmatch '^[a-zA-Z0-9][a-zA-Z0-9_.-]*$') { throw '::error::container_name contains unsupported characters.' }
+          foreach ($port in @($env:HOST_PORT, $env:CONTAINER_PORT)) {
+            $value = 0
+            if (-not [int]::TryParse($port, [ref]$value) -or $value -lt 1 -or $value -gt 65535) { throw '::error::host_port and container_port must be valid TCP ports.' }
+          }
+          $health = [Uri]$env:HEALTH_CHECK_URL
+          if ($health.Scheme -ne 'http' -or $health.Host -notin @('localhost', '127.0.0.1') -or -not $health.AbsolutePath.StartsWith('/')) { throw '::error::health_check_url must be an HTTP localhost URL.' }
+          "image_ref=$($env:IMAGE_URI.Split(':')[0])@$env:IMAGE_DIGEST" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+      - name: Pull and replace the exact scanned image
+        shell: pwsh
+        env:
+          IMAGE_REF: ${{ steps.prepare.outputs.image_ref }}
+          CONTAINER_NAME: ${{ inputs.container_name }}
+          HOST_PORT: ${{ inputs.host_port }}
+          CONTAINER_PORT: ${{ inputs.container_port }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          docker version --format 'Docker client={{.Client.Version}} server={{.Server.Version}} API={{.Server.APIVersion}}'
+          docker pull $env:IMAGE_REF
+          $existing = docker ps --all --quiet --filter "name=^/$($env:CONTAINER_NAME)$"
+          if (-not [string]::IsNullOrWhiteSpace($existing)) { docker rm --force $existing }
+          docker run --detach --name $env:CONTAINER_NAME --restart unless-stopped --publish "$($env:HOST_PORT):$($env:CONTAINER_PORT)" $env:IMAGE_REF
+          $deployedImage = docker inspect --format '{{.Config.Image}}' $env:CONTAINER_NAME
+          if ($deployedImage -ne $env:IMAGE_REF) { throw '::error::The running container does not use the requested image digest.' }
+      - name: Verify application health and deployed revision
+        id: health
+        shell: pwsh
+        env:
+          HEALTH_CHECK_URL: ${{ inputs.health_check_url }}
+          EXPECTED_REVISION: ${{ inputs.app_revision }}
+          IMAGE_REF: ${{ steps.prepare.outputs.image_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $deadline = (Get-Date).AddMinutes(5)
+          do {
+            try {
+              $response = Invoke-RestMethod -Uri $env:HEALTH_CHECK_URL -TimeoutSec 15 -Headers @{ 'Cache-Control' = 'no-cache' }
+              if ($response.status -eq 'ok' -and $response.revision -eq $env:EXPECTED_REVISION) {
+                "deployment_url=$($env:HEALTH_CHECK_URL)" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+                "## Docker Desktop deployment`n`nURL: $($env:HEALTH_CHECK_URL)`n`nImage: $env:IMAGE_REF`n`nContainer: $env:CONTAINER_NAME`n`nRevision: $env:EXPECTED_REVISION`n`nHealth and revision checks: passed" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+                exit 0
+              }
+            } catch { Write-Host 'Waiting for the expected Docker Desktop container to become healthy...' }
+            Start-Sleep -Seconds 5
+          } while ((Get-Date) -lt $deadline)
+          throw '::error::Docker Desktop container did not pass health and revision checks within 300 seconds.'
