@@ -67,7 +67,7 @@ on:
         type: boolean
         default: false
       image_registry:
-        description: Image registry: ghcr or dockerhub.
+        description: Image registry ghcr or dockerhub.
         required: false
         type: string
         default: ghcr
