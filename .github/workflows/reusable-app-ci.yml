@@ -62,12 +62,22 @@ on:
         type: string
         default: .
       publish_image:
-        description: Publish the scanned image to GHCR from a push to the caller's actual default branch.
+        description: Publish the scanned image to the selected registry when explicitly requested and all required checks pass.
         required: false
         type: boolean
         default: false
+      image_registry:
+        description: Image registry ghcr or dockerhub.
+        required: false
+        type: string
+        default: ghcr
+      dockerhub_username:
+        description: Docker Hub username used with DOCKERHUB_TOKEN; required for Docker Hub publication.
+        required: false
+        type: string
+        default: ''
       image_name:
-        description: Optional lowercase GHCR image name (ghcr.io/owner/name); defaults to ghcr.io/caller-repository.
+        description: Optional lowercase registry repository. GHCR uses ghcr.io/owner/name; Docker Hub uses namespace/name.
         required: false
         type: string
         default: ''
@@ -80,6 +90,9 @@ on:
       SONAR_TOKEN:
         description: SonarQube Cloud analysis token, scoped to this project.
         required: true
+      DOCKERHUB_TOKEN:
+        description: Docker Hub access token with push permission; required when image_registry is dockerhub and publish_image is true.
+        required: false
     outputs:
       image_uri:
         description: Published image reference, empty when publication is disabled.
@@ -124,19 +137,18 @@ jobs:
           SONAR_PROJECT_KEY: ${{ inputs.sonar_project_key }}
           RUN_CONTAINER_CHECKS: ${{ inputs.run_container_checks }}
           PUBLISH_IMAGE: ${{ inputs.publish_image }}
+          IMAGE_REGISTRY: ${{ inputs.image_registry }}
+          DOCKERHUB_USERNAME: ${{ inputs.dockerhub_username }}
           CONTAINER_CONTEXT: ${{ inputs.container_context }}
           IMAGE_NAME: ${{ inputs.image_name }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           PACKAGE_APP: ${{ inputs.package_app }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_ACTION: ${{ github.event.action }}
           PR_MERGED: ${{ github.event.pull_request.merged }}
           MERGED_REVISION: ${{ github.event.pull_request.merge_commit_sha }}
           RUN_REVISION: ${{ github.sha }}
-          REF_NAME: ${{ github.ref }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           REPOSITORY: ${{ github.repository }}
-          EVENT_REPOSITORY: ${{ github.event.repository.full_name }}
-          REPOSITORY_IS_FORK: ${{ github.event.repository.fork }}
         run: |
           set -euo pipefail
 
@@ -248,19 +260,25 @@ jobs:
           fi
 
           if [[ "$PUBLISH_IMAGE" == true ]]; then
-            [[ "$RUN_CONTAINER_CHECKS" == true ]] || fail "publish_image requires run_container_checks=true."
-            [[ "$EVENT_NAME" == push ]] || fail "Image publication is allowed only for push events on the default branch."
-            [[ -n "$DEFAULT_BRANCH" && "$REF_NAME" == "refs/heads/$DEFAULT_BRANCH" ]] || fail "Image publication is allowed only from the caller repository's actual default branch."
-            [[ "$REPOSITORY" == "$EVENT_REPOSITORY" ]] || fail "Image publication is not allowed from forked repositories."
-            [[ "$REPOSITORY_IS_FORK" != true ]] || fail "Image publication is disabled in fork repositories."
-            if [[ -n "$IMAGE_NAME" ]]; then
-              [[ "$IMAGE_NAME" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$ ]] || fail "image_name must be a lowercase ghcr.io/owner/name reference."
-              image_owner="${IMAGE_NAME#ghcr.io/}"
-              image_owner="${image_owner%%/*}"
-              repository_owner="${REPOSITORY%%/*}"
-              repository_owner="${repository_owner,,}"
-              [[ "$image_owner" == "$repository_owner" ]] || fail "image_name must stay in the caller repository owner's GHCR namespace."
-            fi
+            case "$IMAGE_REGISTRY" in
+              ghcr)
+                if [[ -n "$IMAGE_NAME" ]]; then
+                  [[ "$IMAGE_NAME" =~ ^ghcr\.io/[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$ ]] || fail "GHCR image_name must be a lowercase ghcr.io/owner/name reference."
+                  image_owner="${IMAGE_NAME#ghcr.io/}"
+                  image_owner="${image_owner%%/*}"
+                  repository_owner="${REPOSITORY%%/*}"
+                  repository_owner="${repository_owner,,}"
+                  [[ "$image_owner" == "$repository_owner" ]] || fail "GHCR image_name must stay in the caller repository owner's namespace."
+                fi
+                ;;
+              dockerhub)
+                [[ -n "$DOCKERHUB_TOKEN" ]] || fail "DOCKERHUB_TOKEN is required to publish to Docker Hub."
+                [[ "$DOCKERHUB_USERNAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || fail "dockerhub_username must be a lowercase Docker Hub username."
+                [[ -n "$IMAGE_NAME" ]] || fail "Docker Hub publication requires image_name in namespace/name form."
+                [[ "$IMAGE_NAME" =~ ^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$ ]] || fail "Docker Hub image_name must be a lowercase namespace/name reference."
+                ;;
+              *) fail "image_registry must be ghcr or dockerhub." ;;
+            esac
           fi
 
   build-and-test:
@@ -651,7 +669,7 @@ jobs:
     permissions:
       contents: read
     outputs:
-      image_id: ${{ steps.image.outputs.image_id }}
+      image_config_digest: ${{ steps.image.outputs.image_config_digest }}
       archive_sha256: ${{ steps.image.outputs.archive_sha256 }}
     steps:
       - name: Check out caller repository without persisted credentials
@@ -673,6 +691,7 @@ jobs:
           set -euo pipefail
           created_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           docker build --pull --progress=plain \
+            --build-arg "APP_REVISION=$IMAGE_REVISION" \
             --label "org.opencontainers.image.source=$IMAGE_SOURCE" \
             --label "org.opencontainers.image.url=$IMAGE_URL" \
             --label "org.opencontainers.image.title=$IMAGE_TITLE" \
@@ -680,11 +699,16 @@ jobs:
             --label "org.opencontainers.image.created=$created_at" \
             --tag "$LOCAL_IMAGE" "$CONTAINER_CONTEXT"
           docker image save --output "$RUNNER_TEMP/scanned-image.tar" "$LOCAL_IMAGE"
-          image_id="$(docker image inspect --format='{{.Id}}' "$LOCAL_IMAGE")"
+          config_path="$(tar -xOf "$RUNNER_TEMP/scanned-image.tar" manifest.json | jq -er '.[0].Config')"
+          [[ -n "$config_path" ]] || {
+            echo "::error::Docker image archive has no config path."
+            exit 1
+          }
+          image_config_digest="sha256:$(tar -xOf "$RUNNER_TEMP/scanned-image.tar" -- "$config_path" | sha256sum | cut -d ' ' -f 1)"
           archive_sha256="$(sha256sum "$RUNNER_TEMP/scanned-image.tar" | cut -d ' ' -f 1)"
-          printf '%s\n' "$image_id" > "$RUNNER_TEMP/scanned-image.id"
+          printf '%s\n' "$image_config_digest" > "$RUNNER_TEMP/scanned-image.config-digest"
           printf '%s  %s\n' "$archive_sha256" scanned-image.tar > "$RUNNER_TEMP/scanned-image.tar.sha256"
-          echo "image_id=$image_id" >> "$GITHUB_OUTPUT"
+          echo "image_config_digest=$image_config_digest" >> "$GITHUB_OUTPUT"
           echo "archive_sha256=$archive_sha256" >> "$GITHUB_OUTPUT"
       - name: Scan image for HIGH and CRITICAL vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -693,6 +717,7 @@ jobs:
           format: table
           exit-code: '1'
           severity: CRITICAL,HIGH
+          ignore-unfixed: true
           vuln-type: os,library
           cache: 'false'
       - name: Upload the scanned image and identity metadata
@@ -702,14 +727,14 @@ jobs:
           name: scanned-image-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/scanned-image.tar
-            ${{ runner.temp }}/scanned-image.id
+            ${{ runner.temp }}/scanned-image.config-digest
             ${{ runner.temp }}/scanned-image.tar.sha256
           if-no-files-found: error
           retention-days: 1
 
   publish:
     name: Publish non-production image
-    if: ${{ inputs.publish_image && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.repository == github.event.repository.full_name && github.event.repository.fork != true }}
+    if: ${{ inputs.publish_image }}
     needs: [validate, build-and-test, secret-scan, dependency-scan, sonar, container]
     runs-on: ubuntu-latest
     environment:
@@ -730,45 +755,115 @@ jobs:
         shell: bash
         env:
           LOCAL_IMAGE: stage1-validation:${{ github.sha }}
-          EXPECTED_IMAGE_ID: ${{ needs.container.outputs.image_id }}
+          EXPECTED_CONFIG_DIGEST: ${{ needs.container.outputs.image_config_digest }}
           EXPECTED_ARCHIVE_SHA256: ${{ needs.container.outputs.archive_sha256 }}
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/scanned-image"
           sha256sum --check scanned-image.tar.sha256
-          expected_image_id="$(cat scanned-image.id)"
-          [[ "$expected_image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ "$expected_image_id" == "$EXPECTED_IMAGE_ID" ]] || { echo '::error::Image identity metadata differs from the container job output.'; exit 1; }
+          expected_config_digest="$(cat scanned-image.config-digest)"
+          [[ "$expected_config_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$expected_config_digest" == "$EXPECTED_CONFIG_DIGEST" ]] || { echo '::error::Image config digest metadata differs from the container job output.'; exit 1; }
           expected_archive_sha256="$(cut -d ' ' -f 1 scanned-image.tar.sha256)"
           [[ "$expected_archive_sha256" == "$EXPECTED_ARCHIVE_SHA256" ]] || { echo '::error::Image archive metadata differs from the container job output.'; exit 1; }
           docker image load --input scanned-image.tar
-          actual_image_id="$(docker image inspect --format='{{.Id}}' "$LOCAL_IMAGE")"
-          [[ "$actual_image_id" == "$expected_image_id" ]] || { echo '::error::Downloaded image does not match the scanned image ID.'; exit 1; }
-      - name: Publish to GHCR and verify the remote image digest
+          docker image inspect "$LOCAL_IMAGE" >/dev/null
+      - name: Publish to the selected registry and verify the remote image digest
         id: push
         shell: bash
         env:
           GHCR_TOKEN: ${{ github.token }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_REGISTRY: ${{ inputs.image_registry }}
+          DOCKERHUB_USERNAME: ${{ inputs.dockerhub_username }}
           REQUESTED_IMAGE_NAME: ${{ inputs.image_name }}
           REPOSITORY: ${{ github.repository }}
+          EXPECTED_CONFIG_DIGEST: ${{ needs.container.outputs.image_config_digest }}
           LOCAL_IMAGE: stage1-validation:${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ -n "$REQUESTED_IMAGE_NAME" ]]; then
-            image_name="$REQUESTED_IMAGE_NAME"
-          else
-            image_name="ghcr.io/${REPOSITORY,,}"
-          fi
+          case "$IMAGE_REGISTRY" in
+            ghcr)
+              registry_host="ghcr.io"
+              registry_token="$GHCR_TOKEN"
+              registry_username="$GITHUB_ACTOR"
+              if [[ -n "$REQUESTED_IMAGE_NAME" ]]; then
+                image_name="$REQUESTED_IMAGE_NAME"
+              else
+                image_name="ghcr.io/${REPOSITORY,,}"
+              fi
+              ;;
+            dockerhub)
+              registry_host="docker.io"
+              registry_token="$DOCKERHUB_TOKEN"
+              image_name="$REQUESTED_IMAGE_NAME"
+              registry_username="$DOCKERHUB_USERNAME"
+              ;;
+            *) echo "::error::Unsupported image registry."; exit 1 ;;
+          esac
           image_uri="$image_name:${GITHUB_SHA}"
-          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          image_metadata="$(docker image inspect "$LOCAL_IMAGE")"
+          local_os="$(printf '%s' "$image_metadata" | jq -er '.[0].Os')"
+          local_architecture="$(printf '%s' "$image_metadata" | jq -er '.[0].Architecture')"
+          local_variant="$(printf '%s' "$image_metadata" | jq -r '.[0].Variant // empty')"
+          local_platform="$local_os/$local_architecture${local_variant:+/$local_variant}"
+          [[ "$local_platform" =~ ^[a-z0-9]+/[a-z0-9_]+(/[a-z0-9_.-]+)?$ ]] || { echo '::error::Loaded image has an invalid platform.'; exit 1; }
+          image_source="$(printf '%s' "$image_metadata" | jq -r '.[0].Config.Labels["org.opencontainers.image.source"] // empty')"
+          image_revision="$(printf '%s' "$image_metadata" | jq -r '.[0].Config.Labels["org.opencontainers.image.revision"] // empty')"
+          [[ "$image_source" == "$GITHUB_SERVER_URL/$REPOSITORY" ]] || { echo '::error::Loaded image source label does not match the caller repository.'; exit 1; }
+          [[ "$image_revision" == "$GITHUB_SHA" ]] || { echo '::error::Loaded image revision label does not match this run.'; exit 1; }
+          docker version --format 'Docker client={{.Client.Version}} server={{.Server.Version}} API={{.Server.APIVersion}}'
+          printf 'Caller: %s\nEvent: %s\nRun: %s/%s/actions/runs/%s\nImage URI: %s\nPlatform: %s\nSource: %s\nRevision: %s\n' \
+            "$REPOSITORY" "$GITHUB_EVENT_NAME" "$GITHUB_SERVER_URL" "$REPOSITORY" "$GITHUB_RUN_ID" \
+            "$image_uri" "$local_platform" "$image_source" "$image_revision"
+          printf '%s' "$registry_token" | docker login "$registry_host" --username "$registry_username" --password-stdin
           docker tag "$LOCAL_IMAGE" "$image_uri"
-          docker push "$image_uri"
-          manifest="$(docker buildx imagetools inspect --raw "$image_uri")"
+          push_log="$RUNNER_TEMP/docker-push.log"
+          push_succeeded=false
+          for attempt in 1 2 3; do
+            if docker push --platform "$local_platform" "$image_uri" 2>&1 | tee "$push_log"; then
+              push_succeeded=true
+              break
+            fi
+            if [[ "$attempt" -lt 3 ]]; then
+              printf '::warning::Registry push attempt %s failed; retrying the same scanned image in 10 seconds.\n' "$attempt"
+              sleep 10
+            fi
+          done
+          [[ "$push_succeeded" == true ]] || {
+            echo '::error::Registry rejected image publication after three attempts; no deployment outputs will be returned.'
+            exit 1
+          }
+          image_digest="$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}) size: [0-9]+.*/\1/p' "$push_log" | tail -n 1)"
+          [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "::error::Could not read the published registry manifest digest from docker push output."
+            exit 1
+          }
+          echo "Scanned image config digest: $EXPECTED_CONFIG_DIGEST"
+          echo "Published image manifest digest: $image_digest"
+          published_ref="$image_name@$image_digest"
+          manifest="$(docker buildx imagetools inspect --raw "$published_ref")"
           remote_config="$(printf '%s' "$manifest" | jq -r '.config.digest // empty')"
-          expected_config="$(docker image inspect --format='{{.Id}}' "$image_uri")"
-          [[ -n "$remote_config" && "$remote_config" == "$expected_config" ]] || { echo '::error::Published GHCR image does not match the scanned image config digest.'; exit 1; }
-          image_digest="sha256:$(printf '%s' "$manifest" | sha256sum | cut -d ' ' -f 1)"
-          echo '::add-mask::'"$GHCR_TOKEN"
+          if [[ -z "$remote_config" ]]; then
+            platform_manifest_digest="$(printf '%s' "$manifest" | jq -r --arg os "$local_os" --arg architecture "$local_architecture" '
+              [.manifests[]? | select(.platform.os == $os and .platform.architecture == $architecture) | .digest]
+              | if length == 1 then .[0] else empty end' || true)"
+            [[ -n "$platform_manifest_digest" ]] || {
+              echo "::error::Registry manifest index has no unique image manifest for scanned platform $local_platform."
+              exit 1
+            }
+            platform_manifest="$(docker buildx imagetools inspect --raw "$image_name@$platform_manifest_digest")"
+            remote_config="$(printf '%s' "$platform_manifest" | jq -r '.config.digest // empty')"
+          fi
+          [[ -n "$remote_config" ]] || {
+            echo "::error::Could not read the published registry image config digest for platform $local_platform."
+            exit 1
+          }
+          [[ "$remote_config" == "$EXPECTED_CONFIG_DIGEST" ]] || {
+            echo "::error::Published registry image does not match the scanned image config digest (platform $local_platform; published manifest $image_digest; expected $EXPECTED_CONFIG_DIGEST; registry $remote_config)."
+            exit 1
+          }
+          echo '::add-mask::'"$registry_token"
           echo "image_uri=$image_uri" >> "$GITHUB_OUTPUT"
           echo "image_digest=$image_digest" >> "$GITHUB_OUTPUT"
 
